@@ -1722,7 +1722,11 @@ export class ExtractionOrchestrator {
       // Store: on the writer thread when active (fresh DB — bundles applied
       // in the same file order this chain dispatches them), else on the main
       // thread (SQLite connections are per-thread).
-      if (nodeCount > 0 || result.errors.length === 0) {
+      if (
+        nodeCount > 0 ||
+        result.errors.length === 0 ||
+        result.errors.some((error) => error.code === 'size_exceeded')
+      ) {
         const language = detectLanguage(filePath, content, overrides);
         if (storeWriter) {
           if (result.kernelBuffers) {
@@ -1817,11 +1821,16 @@ export class ExtractionOrchestrator {
     // Dispatch one file's parse (parses run concurrently across the pool), tagged
     // with its file-order sequence so flushOrdered commits results in order. The
     // backpressure below bounds how far parsing runs ahead of the in-order commit.
-    const feed = async (filePath: string, content: string, stats: fs.Stats): Promise<void> => {
+    const feed = async (
+      filePath: string,
+      content: string,
+      stats: fs.Stats,
+      knownResult?: ExtractionResult
+    ): Promise<void> => {
       const seq = nextSeq++;
       const p = (async () => {
         try {
-          const result = await parseFile(filePath, content);
+          const result = knownResult ?? await parseFile(filePath, content);
           completed.set(seq, { ok: true, filePath, content, stats, result });
         } catch (parseErr) {
           completed.set(seq, { ok: false, filePath, err: parseErr });
@@ -1895,15 +1904,22 @@ export class ExtractionOrchestrator {
         // useful symbols. The single-file extractFile path already enforces
         // this; the bulk path used to silently skip the check.
         if (stats.size > MAX_FILE_SIZE) {
-          processed++;
-          filesSkipped++;
-          errors.push({
-            message: `File exceeds max size (${stats.size} > ${MAX_FILE_SIZE})`,
-            filePath,
-            severity: 'warning',
-            code: 'size_exceeded',
+          // Commit a zero-node file record through the same ordered store path
+          // as parsed files. Without that baseline, every subsequent sync sees
+          // this supported source file as newly added until it becomes small
+          // enough to parse.
+          await feed(filePath, content, stats, {
+            nodes: [],
+            edges: [],
+            unresolvedReferences: [],
+            errors: [{
+              message: `File exceeds max size (${stats.size} > ${MAX_FILE_SIZE})`,
+              filePath,
+              severity: 'warning',
+              code: 'size_exceeded',
+            }],
+            durationMs: 0,
           });
-          onProgress?.({ phase: 'parsing', current: processed, total });
           continue;
         }
 
@@ -2205,9 +2221,13 @@ export class ExtractionOrchestrator {
       };
     }
 
+    // Detect language once up front so an oversized supported source file can
+    // still be tracked as a zero-node record for convergent future syncs.
+    const language = detectLanguage(relativePath, content, loadExtensionOverrides(this.rootDir));
+
     // Check file size
     if (stats.size > MAX_FILE_SIZE) {
-      return {
+      const result: ExtractionResult = {
         nodes: [],
         edges: [],
         unresolvedReferences: [],
@@ -2221,10 +2241,12 @@ export class ExtractionOrchestrator {
         ],
         durationMs: 0,
       };
+      if (isLanguageSupported(language)) {
+        await this.storeExtractionResult(relativePath, content, language, stats, result, createYielder());
+      }
+      return result;
     }
 
-    // Detect language (honoring the project's codegraph.json extension overrides)
-    const language = detectLanguage(relativePath, content, loadExtensionOverrides(this.rootDir));
     if (!isLanguageSupported(language)) {
       return {
         nodes: [],

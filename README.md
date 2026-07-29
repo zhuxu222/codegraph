@@ -595,6 +595,26 @@ cg.unwatch(); // stop watching
 cg.close();
 ```
 
+To keep generated state outside the source repository, pass a project location
+instead of a string. Source discovery, configuration, extraction, and watching
+still use `projectRoot`; the database, lock, and generated metadata use
+`dataDir`.
+
+```typescript
+const location = {
+  projectRoot: '/workspace/repos/service',
+  dataDir: '/workspace/.workspace/codegraph/indexes/service/.codegraph'
+};
+
+const cg = await CodeGraph.init(location);
+// Later processes can reopen the same external index:
+// const cg = await CodeGraph.open(location);
+```
+
+String inputs remain backward-compatible and store data in
+`<projectRoot>/.codegraph`. MCP callers continue to pass the source
+`projectPath`; an MCP project provider owns the mapping to external storage.
+
 Lower-level building blocks are exported from the same entry point for callers
 that drive the graph directly: `DatabaseConnection`, `QueryBuilder`,
 `getDatabasePath`, `initGrammars` / `loadGrammarsForLanguages`, and `FileLock`.

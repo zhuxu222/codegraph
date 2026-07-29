@@ -758,6 +758,81 @@ describe('Sync Module', () => {
   });
 });
 
+describe('Oversized source sync convergence', () => {
+  let testDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-sync-oversized-'));
+    fs.mkdirSync(path.join(testDir, 'src'));
+  });
+
+  afterEach(() => {
+    cg?.destroy();
+    if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it('tracks an indexAll size skip, then indexes the file after it shrinks', async () => {
+    const sourcePath = path.join(testDir, 'src', 'oversized.ts');
+    fs.writeFileSync(
+      sourcePath,
+      `export function tooLargeToIndex() { return 1; }\n${' '.repeat(1024 * 1024)}`
+    );
+
+    cg = CodeGraph.initSync(testDir);
+    const indexed = await cg.indexAll();
+    expect(indexed.filesSkipped).toBe(1);
+    expect(indexed.errors).toEqual(
+      expect.arrayContaining([expect.objectContaining({ filePath: 'src/oversized.ts', code: 'size_exceeded' })])
+    );
+
+    const unchanged = await cg.sync();
+    expect(unchanged.filesAdded).toBe(0);
+    expect(unchanged.filesModified).toBe(0);
+    expect(unchanged.filesRemoved).toBe(0);
+
+    fs.writeFileSync(sourcePath, `export function nowIndexable() { return 42; }\n`);
+    const shrunk = await cg.sync();
+    expect(shrunk.filesAdded).toBe(0);
+    expect(shrunk.filesModified).toBe(1);
+    expect(cg.searchNodes('nowIndexable').length).toBeGreaterThan(0);
+  });
+
+  it('removes stale symbols when a tracked file grows oversized', async () => {
+    const sourcePath = path.join(testDir, 'src', 'resized.ts');
+    fs.writeFileSync(
+      sourcePath,
+      'export function originallyIndexable() { return 1; }\n'
+    );
+
+    cg = CodeGraph.initSync(testDir);
+    await cg.indexAll();
+    expect(cg.searchNodes('originallyIndexable').length).toBeGreaterThan(0);
+
+    fs.writeFileSync(
+      sourcePath,
+      `export function staleAfterGrowth() { return 2; }\n${' '.repeat(1024 * 1024)}`
+    );
+    const oversized = await cg.sync({ paths: ['src/resized.ts'] });
+    expect(oversized.filesModified).toBe(1);
+    expect(cg.searchNodes('originallyIndexable')).toHaveLength(0);
+    expect(cg.searchNodes('staleAfterGrowth')).toHaveLength(0);
+
+    const unchanged = await cg.sync();
+    expect(unchanged.filesAdded).toBe(0);
+    expect(unchanged.filesModified).toBe(0);
+    expect(unchanged.filesRemoved).toBe(0);
+
+    fs.writeFileSync(
+      sourcePath,
+      'export function restoredAfterShrink() { return 3; }\n'
+    );
+    const restored = await cg.sync({ paths: ['src/resized.ts'] });
+    expect(restored.filesModified).toBe(1);
+    expect(cg.searchNodes('restoredAfterShrink').length).toBeGreaterThan(0);
+  });
+});
+
 describe('Scoped sync parity (#watcher-scoped)', () => {
   let testDir: string;
   let cg: CodeGraph;
