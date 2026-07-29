@@ -691,10 +691,13 @@ export class CodeGraph {
 
         // Stamp the index with the engine that built it, so `codegraph status`
         // and `codegraph upgrade` can recommend a re-index when the running
-        // engine produces richer extraction than the one on disk. Only on a
-        // real full index — a sync touches a subset, so it must NOT advance the
-        // extraction stamp (the bulk would still be stale). See extraction-version.ts.
-        if (result.success && result.filesIndexed > 0) {
+        // engine produces richer extraction than the one on disk. A successful
+        // full index is authoritative even when the project has zero supported
+        // source files: that is a valid, complete empty graph and still needs
+        // build/extraction metadata for health checks. A sync touches only a
+        // subset, so it must NOT advance the extraction stamp (the bulk would
+        // still be stale). See extraction-version.ts.
+        if (result.success) {
           try {
             this.queries.setMetadata('indexed_with_version', CodeGraphPackageVersion);
             this.queries.setMetadata('indexed_with_extraction_version', String(EXTRACTION_VERSION));

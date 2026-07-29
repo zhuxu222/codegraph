@@ -710,6 +710,22 @@ describe('index extraction-version stamp / isIndexStale', () => {
     cg.destroy();
   });
 
+  it('stamps build metadata and completes a valid empty index', async () => {
+    const cg = await CodeGraph.init(dir, { index: false });
+
+    const result = await cg.indexAll();
+    const info = cg.getIndexBuildInfo();
+
+    expect(result.success).toBe(true);
+    expect(result.filesIndexed).toBe(0);
+    expect(result.filesDiscovered).toBe(0);
+    expect(cg.getIndexState()).toBe('complete');
+    expect(info.extractionVersion).toBe(EXTRACTION_VERSION);
+    expect(typeof info.version).toBe('string');
+    expect(info.version).not.toHaveLength(0);
+    cg.destroy();
+  });
+
   it('flags an index stamped by an older extraction version as stale', async () => {
     fs.writeFileSync(path.join(dir, 'a.ts'), 'export function hello() { return 1; }\n');
     const cg = await CodeGraph.init(dir, { index: false });
