@@ -30,7 +30,11 @@
  */
 
 import * as fs from 'fs';
+import * as crypto from 'crypto';
+import * as os from 'os';
 import * as path from 'path';
+import { spawnSync } from 'child_process';
+import { Worker } from 'worker_threads';
 
 // ============================================================
 // SECURITY UTILITIES
@@ -214,85 +218,153 @@ export function normalizePath(filePath: string): string {
   return filePath.replace(/\\/g, '/');
 }
 
+interface FileLockLease {
+  nonce: string;
+  pid: number;
+  /** OS process-birth identity used to distinguish a live owner from PID reuse. */
+  processStartToken: string | null;
+  hostId: string;
+  acquiredAt: number;
+  heartbeatAt: number;
+}
+
+interface FileLockSnapshot {
+  raw: string;
+  stat: fs.Stats;
+}
+
+export interface FileLockOptions {
+  /** How often the independent lease worker refreshes the heartbeat. */
+  heartbeatIntervalMs?: number;
+  /** How long a remote or unreadable lease may go without a heartbeat. */
+  staleTimeoutMs?: number;
+}
+
 /**
- * Cross-process file lock using a lock file with PID tracking.
+ * Identify one OS/PID namespace, not merely one physical machine.
  *
- * Prevents multiple processes (e.g., git hooks, CLI, MCP server) from
- * writing to the same database simultaneously.
+ * Native Windows and WSL commonly report the same hostname while using
+ * unrelated PID namespaces. Including the platform profile forces those
+ * contenders to use the renewable-heartbeat (remote lease) rules.
+ */
+export function fileLockHostId(): string {
+  const hostname = os.hostname() || 'unknown-host';
+  const isWsl = process.platform === 'linux'
+    && (
+      Boolean(process.env.WSL_DISTRO_NAME)
+      || /microsoft|wsl/iu.test(os.release())
+    );
+  const platform = isWsl
+    ? `wsl:${process.env.WSL_DISTRO_NAME ?? 'unknown'}`
+    : process.platform;
+  return `${hostname}:${platform}:${process.arch}`;
+}
+
+/**
+ * Cross-process file lock backed by a renewable lease.
+ *
+ * Acquisition uses O_CREAT|O_EXCL, so only one contender can create the lease.
+ * A dedicated worker thread renews the heartbeat even while indexing keeps the
+ * main event loop busy. Local leases are additionally protected by a live-PID
+ * check; remote leases use the heartbeat because their PID namespace is not
+ * meaningful on this host.
  */
 export class FileLock {
-  private lockPath: string;
+  private static readonly DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
+  private static readonly DEFAULT_STALE_TIMEOUT_MS = 90_000;
+  private static readonly MAX_ACQUIRE_ATTEMPTS = 8;
+  private static sharedHeartbeatWorker: Worker | null = null;
+  private static currentProcessStartToken: string | null | undefined;
+
+  private readonly lockPath: string;
+  private readonly heartbeatIntervalMs: number;
+  private readonly staleTimeoutMs: number;
+  private readonly hostId = fileLockHostId();
   private held = false;
+  private nonce: string | null = null;
+  private heartbeatId: string | null = null;
+  private heartbeatControl: Int32Array | null = null;
 
-  /** Locks older than this are considered stale regardless of PID status */
-  private static readonly STALE_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes
-
-  constructor(lockPath: string) {
+  constructor(lockPath: string, options: FileLockOptions = {}) {
     this.lockPath = lockPath;
+    this.heartbeatIntervalMs = FileLock.positiveDuration(
+      options.heartbeatIntervalMs,
+      FileLock.DEFAULT_HEARTBEAT_INTERVAL_MS,
+      'heartbeatIntervalMs'
+    );
+    this.staleTimeoutMs = FileLock.positiveDuration(
+      options.staleTimeoutMs,
+      FileLock.DEFAULT_STALE_TIMEOUT_MS,
+      'staleTimeoutMs'
+    );
   }
 
   /**
    * Acquire the lock. Throws if the lock is held by another live process.
    */
   acquire(): void {
-    // Check for existing lock
-    if (fs.existsSync(this.lockPath)) {
+    const now = Date.now();
+    const lease: FileLockLease = {
+      nonce: crypto.randomUUID(),
+      pid: process.pid,
+      processStartToken: FileLock.getProcessStartToken(process.pid),
+      hostId: this.hostId,
+      acquiredAt: now,
+      heartbeatAt: now,
+    };
+
+    for (let attempt = 0; attempt < FileLock.MAX_ACQUIRE_ATTEMPTS; attempt++) {
       try {
-        const content = fs.readFileSync(this.lockPath, 'utf-8').trim();
-        const pid = parseInt(content, 10);
-        const stat = fs.statSync(this.lockPath);
-        const lockAge = Date.now() - stat.mtimeMs;
-
-        // Treat locks older than the timeout as stale, regardless of PID
-        if (lockAge < FileLock.STALE_TIMEOUT_MS && !isNaN(pid) && this.isProcessAlive(pid)) {
-          throw new Error(
-            `CodeGraph database is locked by another process (PID ${pid}). ` +
-            `If this is stale, run 'codegraph unlock' or delete ${this.lockPath}`
-          );
-        }
-
-        // Stale lock (dead process or timed out) - remove it
-        fs.unlinkSync(this.lockPath);
-      } catch (err) {
-        if (err instanceof Error && err.message.includes('locked by another')) {
-          throw err;
-        }
-        // Other errors reading lock file - try to remove it
-        try { fs.unlinkSync(this.lockPath); } catch { /* ignore */ }
+        fs.writeFileSync(this.lockPath, FileLock.serializeLease(lease), {
+          encoding: 'utf8',
+          flag: 'wx',
+          mode: 0o600,
+        });
+        this.held = true;
+        this.nonce = lease.nonce;
+        this.startHeartbeat();
+        return;
+      } catch (err: unknown) {
+        if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
       }
+
+      const snapshot = this.readSnapshot(this.lockPath);
+      // The owner may have released between our exclusive-create failure and
+      // the read. Retry creation instead of interpreting ENOENT as corruption.
+      if (!snapshot) continue;
+
+      if (!this.isStale(snapshot)) {
+        throw this.lockedError(snapshot);
+      }
+
+      // Reclamation verifies that the path still points at the exact lease we
+      // classified as stale. If it changed, retry and inspect the new owner.
+      if (!this.reclaimIfUnchanged(snapshot)) continue;
     }
 
-    // Write our PID to the lock file using exclusive create flag
-    try {
-      fs.writeFileSync(this.lockPath, String(process.pid), { flag: 'wx' });
-      this.held = true;
-    } catch (err: any) {
-      if (err.code === 'EEXIST') {
-        // Race condition: another process grabbed the lock between our check and write
-        throw new Error(
-          'CodeGraph database is locked by another process. ' +
-          `If this is stale, run 'codegraph unlock' or delete ${this.lockPath}`
-        );
-      }
-      throw err;
-    }
+    throw this.lockedError(this.readSnapshot(this.lockPath));
   }
 
   /**
-   * Release the lock
+   * Release the lock. Only the exact nonce created by this instance may remove
+   * the lease; matching a recycled PID is deliberately insufficient.
    */
   release(): void {
     if (!this.held) return;
+
+    this.stopHeartbeat();
     try {
-      // Only remove if we still own it (check PID)
-      const content = fs.readFileSync(this.lockPath, 'utf-8').trim();
-      if (parseInt(content, 10) === process.pid) {
+      const snapshot = this.readSnapshot(this.lockPath);
+      const lease = snapshot ? FileLock.parseLease(snapshot.raw) : null;
+      if (lease?.nonce === this.nonce) {
         fs.unlinkSync(this.lockPath);
       }
     } catch {
-      // Lock file already gone - that's fine
+      // Lock file already gone or replaced — either way, it is no longer ours.
+    } finally {
+      this.held = false;
+      this.nonce = null;
     }
-    this.held = false;
   }
 
   /**
@@ -319,16 +391,467 @@ export class FileLock {
     }
   }
 
+  private static positiveDuration(
+    value: number | undefined,
+    fallback: number,
+    name: string
+  ): number {
+    if (value === undefined) return fallback;
+    if (!Number.isFinite(value) || value <= 0) {
+      throw new RangeError(`${name} must be a positive finite number`);
+    }
+    return Math.floor(value);
+  }
+
+  private static serializeLease(lease: FileLockLease): string {
+    return JSON.stringify(lease) + '\n';
+  }
+
+  private static parseLease(raw: string): FileLockLease | null {
+    try {
+      const value = JSON.parse(raw.trim()) as Partial<FileLockLease>;
+      if (
+        typeof value.nonce === 'string' &&
+        value.nonce.length > 0 &&
+        Number.isInteger(value.pid) &&
+        (value.pid ?? 0) > 0 &&
+        (
+          value.processStartToken === undefined ||
+          value.processStartToken === null ||
+          (
+            typeof value.processStartToken === 'string' &&
+            value.processStartToken.length > 0
+          )
+        ) &&
+        typeof value.hostId === 'string' &&
+        value.hostId.length > 0 &&
+        typeof value.acquiredAt === 'number' &&
+        Number.isFinite(value.acquiredAt) &&
+        typeof value.heartbeatAt === 'number' &&
+        Number.isFinite(value.heartbeatAt)
+      ) {
+        return {
+          ...value,
+          // Structured leases written before the renewable-lease upgrade did
+          // not carry a process-birth token. Keep them readable and fall back
+          // to the conservative live-PID rule.
+          processStartToken: value.processStartToken ?? null,
+        } as FileLockLease;
+      }
+    } catch {
+      // Legacy PID-only and malformed records are handled conservatively below.
+    }
+    return null;
+  }
+
+  private readSnapshot(filePath: string): FileLockSnapshot | null {
+    let fd: number | null = null;
+    try {
+      fd = fs.openSync(filePath, 'r');
+      return {
+        raw: fs.readFileSync(fd, 'utf8'),
+        stat: fs.fstatSync(fd),
+      };
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw err;
+    } finally {
+      if (fd !== null) fs.closeSync(fd);
+    }
+  }
+
+  private isStale(snapshot: FileLockSnapshot): boolean {
+    const lease = FileLock.parseLease(snapshot.raw);
+    if (lease) {
+      if (this.sameHost(lease.hostId)) {
+        if (!this.isProcessAlive(lease.pid)) return true;
+        // A live PID can belong to a different process after PID reuse. When
+        // both sides have an OS process-birth token, a mismatch is definitive
+        // evidence that the original owner died. If the platform cannot expose
+        // one, remain conservative and keep the live PID authoritative.
+        if (lease.processStartToken !== null) {
+          const currentToken = FileLock.getProcessStartToken(lease.pid);
+          if (
+            !lease.processStartToken.startsWith('fallback:') &&
+            currentToken !== null &&
+            !currentToken.startsWith('fallback:') &&
+            currentToken !== lease.processStartToken
+          ) {
+            return true;
+          }
+        }
+        // A live local process with the same birth token remains authoritative
+        // even if the main thread was suspended beyond the heartbeat timeout.
+        return false;
+      }
+      const lastRenewal = Math.max(lease.heartbeatAt, snapshot.stat.mtimeMs);
+      return Date.now() - lastRenewal > this.staleTimeoutMs;
+    }
+
+    const legacyPid = FileLock.parseLegacyPid(snapshot.raw);
+    if (legacyPid !== null) return !this.isProcessAlive(legacyPid);
+
+    // A recent partial/malformed record may be the tiny create/write window of
+    // a legitimate owner. Only reclaim it after a full stale interval.
+    return Date.now() - snapshot.stat.mtimeMs > this.staleTimeoutMs;
+  }
+
+  private static parseLegacyPid(raw: string): number | null {
+    const trimmed = raw.trim();
+    if (!/^\d+$/.test(trimmed)) return null;
+    const pid = Number(trimmed);
+    return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+  }
+
+  private sameHost(hostId: string): boolean {
+    return hostId.toLocaleLowerCase() === this.hostId.toLocaleLowerCase();
+  }
+
+  private lockedError(snapshot: FileLockSnapshot | null): Error {
+    const lease = snapshot ? FileLock.parseLease(snapshot.raw) : null;
+    const legacyPid = snapshot ? FileLock.parseLegacyPid(snapshot.raw) : null;
+    const pid = lease?.pid ?? legacyPid;
+    const owner = pid === null || pid === undefined ? '' : ` (PID ${pid})`;
+    return new Error(
+      `CodeGraph database is locked by another process${owner}. ` +
+      `If this is stale, run 'codegraph unlock' or delete ${this.lockPath}`
+    );
+  }
+
   /**
-   * Check if a process is still running
+   * Remove the observed stale inode without accidentally unlinking a lease that
+   * won the path in the meantime. Hard links provide an inode-stable comparison
+   * on normal local filesystems; a guarded compare-and-unlink is the fallback
+   * for ExFAT/network filesystems that do not support hard links.
+   */
+  private reclaimIfUnchanged(observed: FileLockSnapshot): boolean {
+    const claimPath =
+      `${this.lockPath}.stale.${process.pid}.${crypto.randomUUID()}`;
+    try {
+      fs.linkSync(this.lockPath, claimPath);
+    } catch (err: unknown) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT') return false;
+      if (['EPERM', 'EACCES', 'ENOTSUP', 'EXDEV', 'EINVAL'].includes(code ?? '')) {
+        return this.reclaimWithGuard(observed);
+      }
+      throw err;
+    }
+
+    try {
+      const claimed = this.readSnapshot(claimPath);
+      const current = this.readSnapshot(this.lockPath);
+      if (
+        !claimed ||
+        !current ||
+        !FileLock.sameSnapshot(observed, claimed) ||
+        !FileLock.sameSnapshot(claimed, current) ||
+        !this.isStale(current)
+      ) {
+        return false;
+      }
+      fs.unlinkSync(this.lockPath);
+      return true;
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      throw err;
+    } finally {
+      try { fs.unlinkSync(claimPath); } catch { /* best-effort tombstone cleanup */ }
+    }
+  }
+
+  private reclaimWithGuard(observed: FileLockSnapshot): boolean {
+    const guardPath = `${this.lockPath}.reclaim`;
+    const guardNonce = crypto.randomUUID();
+    try {
+      fs.writeFileSync(guardPath, guardNonce, {
+        encoding: 'utf8',
+        flag: 'wx',
+        mode: 0o600,
+      });
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException).code === 'EEXIST') {
+        // A reclaimer can itself crash. Its short-lived guard is safe to clear
+        // after the same conservative timeout used for malformed leases.
+        try {
+          const stat = fs.statSync(guardPath);
+          if (Date.now() - stat.mtimeMs > this.staleTimeoutMs) {
+            fs.unlinkSync(guardPath);
+          }
+        } catch { /* another contender changed the guard */ }
+        return false;
+      }
+      throw err;
+    }
+
+    try {
+      const current = this.readSnapshot(this.lockPath);
+      if (!current || !FileLock.sameSnapshot(observed, current) || !this.isStale(current)) {
+        return false;
+      }
+      fs.unlinkSync(this.lockPath);
+      return true;
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      throw err;
+    } finally {
+      try {
+        if (fs.readFileSync(guardPath, 'utf8') === guardNonce) {
+          fs.unlinkSync(guardPath);
+        }
+      } catch { /* another recovery already cleaned it */ }
+    }
+  }
+
+  private static sameSnapshot(a: FileLockSnapshot, b: FileLockSnapshot): boolean {
+    return (
+      a.raw === b.raw &&
+      a.stat.dev === b.stat.dev &&
+      a.stat.ino === b.stat.ino
+    );
+  }
+
+  /**
+   * The heartbeat runs outside the main event loop so synchronous extraction
+   * cannot make a healthy lease appear abandoned to another host.
+   */
+  private startHeartbeat(): void {
+    if (!this.nonce) return;
+
+    // control[0] = heartbeat write in progress; control[1] = stop requested.
+    const control = new Int32Array(new SharedArrayBuffer(2 * Int32Array.BYTES_PER_ELEMENT));
+    const heartbeatId = crypto.randomUUID();
+    const worker = FileLock.getHeartbeatWorker();
+    try {
+      worker.postMessage({
+        type: 'add',
+        id: heartbeatId,
+        lockPath: this.lockPath,
+        nonce: this.nonce,
+        intervalMs: this.heartbeatIntervalMs,
+        control: control.buffer,
+      });
+      this.heartbeatId = heartbeatId;
+      this.heartbeatControl = control;
+    } catch {
+      // The live local-PID check still protects this lease. A later lock
+      // acquisition recreates the shared worker if this one exited.
+    }
+  }
+
+  /**
+   * One process-wide scheduler renews every FileLock lease. Creating a worker
+   * for each short sync floods Windows with threads waiting to exit and can
+   * temporarily pin test/project directories; a shared worker has constant
+   * resource cost while preserving independent intervals and stop controls.
+   */
+  private static getHeartbeatWorker(): Worker {
+    if (FileLock.sharedHeartbeatWorker) return FileLock.sharedHeartbeatWorker;
+
+    const worker = new Worker(
+      `
+        const fs = require('node:fs');
+        const { parentPort } = require('node:worker_threads');
+        const jobs = new Map();
+
+        function remove(id) {
+          const job = jobs.get(id);
+          if (!job) return;
+          clearInterval(job.timer);
+          jobs.delete(id);
+        }
+
+        function heartbeat(id) {
+          const job = jobs.get(id);
+          if (!job) return;
+          const control = job.control;
+          if (Atomics.load(control, 1) !== 0) {
+            remove(id);
+            return;
+          }
+          if (Atomics.compareExchange(control, 0, 0, 1) !== 0) return;
+
+          let fd = null;
+          let shouldStop = false;
+          try {
+            if (Atomics.load(control, 1) !== 0) return;
+            fd = fs.openSync(job.lockPath, 'r+');
+            const raw = fs.readFileSync(fd, 'utf8');
+            const lease = JSON.parse(raw.trim());
+            if (!lease || lease.nonce !== job.nonce) {
+              shouldStop = true;
+              return;
+            }
+
+            const marker = '"heartbeatAt":';
+            const markerIndex = raw.indexOf(marker);
+            const valueStart = markerIndex + marker.length;
+            const oldValue = markerIndex >= 0
+              ? (raw.slice(valueStart).match(/^\\d+/) || [])[0]
+              : undefined;
+            const nextValue = String(Date.now());
+            if (!oldValue || oldValue.length !== nextValue.length) {
+              shouldStop = true;
+              return;
+            }
+
+            const byteOffset = Buffer.byteLength(raw.slice(0, valueStart), 'utf8');
+            fs.writeSync(fd, nextValue, byteOffset, 'utf8');
+            fs.fsyncSync(fd);
+          } catch (err) {
+            if (err && (err.code === 'ENOENT' || err.code === 'EACCES')) {
+              shouldStop = true;
+            }
+          } finally {
+            if (fd !== null) {
+              try { fs.closeSync(fd); } catch {}
+            }
+            Atomics.store(control, 0, 0);
+            Atomics.notify(control, 0);
+            if (shouldStop) remove(id);
+          }
+        }
+
+        if (parentPort) {
+          parentPort.on('message', (message) => {
+            if (message.type === 'add') {
+              const control = new Int32Array(message.control);
+              if (Atomics.load(control, 1) !== 0) return;
+              const job = {
+                lockPath: message.lockPath,
+                nonce: message.nonce,
+                control,
+                timer: null,
+              };
+              job.timer = setInterval(
+                () => heartbeat(message.id),
+                message.intervalMs
+              );
+              jobs.set(message.id, job);
+            } else if (message.type === 'remove') {
+              remove(message.id);
+            }
+          });
+        }
+      `,
+      { eval: true }
+    );
+    worker.unref();
+    worker.on('error', () => {
+      if (FileLock.sharedHeartbeatWorker === worker) {
+        FileLock.sharedHeartbeatWorker = null;
+      }
+    });
+    worker.on('exit', () => {
+      if (FileLock.sharedHeartbeatWorker === worker) {
+        FileLock.sharedHeartbeatWorker = null;
+      }
+    });
+    FileLock.sharedHeartbeatWorker = worker;
+    return worker;
+  }
+
+  private stopHeartbeat(): void {
+    const control = this.heartbeatControl;
+    const heartbeatId = this.heartbeatId;
+    this.heartbeatControl = null;
+    this.heartbeatId = null;
+
+    if (control) {
+      Atomics.store(control, 1, 1);
+      // Wait for an already-running write so release never observes a partial
+      // heartbeat record and leaves behind a lease it still owns.
+      const deadline = Date.now() + 2_000;
+      while (Atomics.load(control, 0) !== 0 && Date.now() < deadline) {
+        Atomics.wait(control, 0, 1, 100);
+      }
+    }
+    if (heartbeatId && FileLock.sharedHeartbeatWorker) {
+      try {
+        FileLock.sharedHeartbeatWorker.postMessage({
+          type: 'remove',
+          id: heartbeatId,
+        });
+      } catch { /* worker already exited */ }
+    }
+  }
+
+  /**
+   * Check if a process is still running. EPERM means the process exists but
+   * belongs to another user, so it must still be treated as alive.
    */
   private isProcessAlive(pid: number): boolean {
     try {
       process.kill(pid, 0);
       return true;
-    } catch {
-      return false;
+    } catch (err: unknown) {
+      return (err as NodeJS.ErrnoException).code === 'EPERM';
     }
+  }
+
+  /**
+   * Return an OS process-birth identity for PID-reuse detection.
+   *
+   * Linux exposes the kernel start tick in `/proc/<pid>/stat`; Windows exposes
+   * creation ticks through Get-Process; POSIX systems without procfs use `ps`.
+   * Failure is intentionally represented as null so callers keep a live PID
+   * rather than risk stealing a valid writer lease.
+   */
+  private static getProcessStartToken(pid: number): string | null {
+    if (pid === process.pid && FileLock.currentProcessStartToken !== undefined) {
+      return FileLock.currentProcessStartToken;
+    }
+
+    let token: string | null = null;
+    try {
+      if (process.platform === 'linux') {
+        const raw = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+        const closeParen = raw.lastIndexOf(') ');
+        if (closeParen >= 0) {
+          // The tail starts at field 3 (`state`); starttime is field 22.
+          const fields = raw.slice(closeParen + 2).trim().split(/\s+/);
+          const startTicks = fields[19];
+          if (startTicks && /^\d+$/.test(startTicks)) {
+            token = `linux:${startTicks}`;
+          }
+        }
+      } else if (process.platform === 'win32') {
+        const command =
+          `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime` +
+          '.ToUniversalTime().Ticks';
+        const result = spawnSync(
+          'powershell.exe',
+          ['-NoProfile', '-NonInteractive', '-Command', command],
+          {
+            encoding: 'utf8',
+            timeout: 3_000,
+            windowsHide: true,
+          }
+        );
+        const ticks = result.status === 0 ? result.stdout.trim() : '';
+        if (/^\d+$/.test(ticks)) token = `windows:${ticks}`;
+      } else {
+        const result = spawnSync(
+          'ps',
+          ['-o', 'lstart=', '-p', String(pid)],
+          { encoding: 'utf8', timeout: 3_000 }
+        );
+        const started = result.status === 0
+          ? result.stdout.trim().replace(/\s+/g, ' ')
+          : '';
+        if (started) token = `${process.platform}:${started}`;
+      }
+    } catch {
+      token = null;
+    }
+
+    if (pid === process.pid) {
+      token ??=
+        `fallback:${process.pid}:` +
+        `${Math.floor(Date.now() - process.uptime() * 1_000)}`;
+      FileLock.currentProcessStartToken = token;
+    }
+    return token;
   }
 }
 

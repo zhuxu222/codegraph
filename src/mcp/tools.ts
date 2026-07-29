@@ -5,7 +5,9 @@
  */
 
 import type CodeGraph from '../index';
-import type { QueryPool } from './query-pool';
+import { AsyncLocalStorage } from 'async_hooks';
+import type { QueryPool, QueryProjectDescriptor } from './query-pool';
+import type { MCPProjectProvider, ProjectHandle } from './project-provider';
 import { findNearestCodeGraphRoot } from '../directory';
 // Lazy-load the heavy CodeGraph chain off the MCP startup path — see the same
 // helper in engine.ts. ToolHandler must load to answer tools/list (static
@@ -836,8 +838,12 @@ export class ToolHandler {
   // main loop stays free for the MCP transport under concurrent load. Null in
   // direct/in-process mode (one client, no concurrency to parallelize).
   private queryPool: QueryPool | null = null;
+  private readonly preparedProject = new AsyncLocalStorage<ProjectHandle>();
 
-  constructor(private cg: CodeGraph | null) {}
+  constructor(
+    private cg: CodeGraph | null,
+    private readonly projectProvider: MCPProjectProvider | null = null,
+  ) {}
 
   /**
    * Engine-only: attach (or detach with null) the worker-thread query pool. The
@@ -910,13 +916,14 @@ export class ToolHandler {
    */
   setDefaultProjectHint(searchedPath: string): void {
     this.defaultProjectHint = searchedPath;
+    this.projectProvider?.setDefaultProjectPath?.(searchedPath);
   }
 
   /**
    * Whether a default CodeGraph instance is available
    */
   hasDefaultCodeGraph(): boolean {
-    return this.cg !== null;
+    return this.projectProvider?.hasDefaultProject?.() ?? this.cg !== null;
   }
 
   /**
@@ -949,12 +956,17 @@ export class ToolHandler {
    */
   getTools(): ToolDefinition[] {
     const allow = this.toolAllowlist();
+    const additional = this.projectProvider?.getAdditionalTools?.() ?? [];
+    const allTools = [...tools, ...additional];
     // No explicit allowlist → the default 4-tool surface (see
     // DEFAULT_MCP_TOOLS for the evidence). An allowlist replaces the
     // default entirely, so any defined tool can be re-enabled.
     let visible = allow
-      ? tools.filter(t => allow.has(t.name.replace(/^codegraph_/, '')))
-      : tools.filter(t => DEFAULT_MCP_TOOLS.has(t.name.replace(/^codegraph_/, '')));
+      ? allTools.filter(t => allow.has(t.name.replace(/^codegraph_/, '')))
+      : [
+          ...tools.filter(t => DEFAULT_MCP_TOOLS.has(t.name.replace(/^codegraph_/, ''))),
+          ...additional,
+        ];
     // No default project loaded → no-root-index case (#993): a gateway server
     // started outside any repo, or a monorepo root whose indexes live in
     // sub-projects. With nothing to fall back to, EVERY call needs an explicit
@@ -965,10 +977,12 @@ export class ToolHandler {
     // null here means "genuinely no default", not a startup race. When a default
     // IS open we leave projectPath optional (below): a bare call falls back to
     // it, exactly as in the common single-project launch.
-    if (!this.cg) return withRequiredProjectPath(visible);
+    if (!this.hasDefaultCodeGraph()) return withRequiredProjectPath(visible);
 
     try {
-      const stats = this.cg.getStats();
+      const stats = this.projectProvider
+        ? this.projectProvider.getPrepared().graph.getStats()
+        : this.cg!.getStats();
       const budget = getExploreBudget(stats.fileCount);
 
       // Tiny-repo tool gating: on projects under TINY_REPO_FILE_THRESHOLD
@@ -1001,7 +1015,12 @@ export class ToolHandler {
         'codegraph_node',
       ]);
       if (stats.fileCount < TINY_REPO_FILE_THRESHOLD) {
-        visible = visible.filter(t => TINY_REPO_CORE_TOOLS.has(t.name));
+        const providerToolNames = new Set(additional.map((tool) => tool.name));
+        visible = visible.filter(
+          (tool) =>
+            TINY_REPO_CORE_TOOLS.has(tool.name) ||
+            providerToolNames.has(tool.name),
+        );
       }
 
       return visible.map(tool => {
@@ -1018,6 +1037,16 @@ export class ToolHandler {
     }
   }
 
+  /** Whether this handler can dispatch a core or provider-owned tool name. */
+  supportsTool(name: string): boolean {
+    return (
+      tools.some((tool) => tool.name === name) ||
+      (this.projectProvider?.getAdditionalTools?.() ?? []).some(
+        (tool) => tool.name === name,
+      )
+    );
+  }
+
   /**
    * Get CodeGraph instance for a project
    *
@@ -1028,6 +1057,14 @@ export class ToolHandler {
    * similar to how git finds .git/ directories.
    */
   private getCodeGraph(projectPath?: string): CodeGraph {
+    if (this.projectProvider) {
+      const prepared = this.preparedProject.getStore();
+      if (prepared) {
+        return this.freshen(prepared.graph);
+      }
+      return this.freshen(this.projectProvider.getPrepared(projectPath).graph);
+    }
+
     if (!projectPath) {
       if (!this.cg) {
         const searched = this.defaultProjectHint ?? process.cwd();
@@ -1138,6 +1175,11 @@ export class ToolHandler {
     }
     this.projectCache.clear();
     this.worktreeMismatchCache.clear();
+    if (this.projectProvider) {
+      void this.projectProvider.close().catch(() => {
+        // Engine shutdown is best-effort and historically synchronous.
+      });
+    }
   }
 
   /**
@@ -1260,6 +1302,25 @@ export class ToolHandler {
   private withStalenessNotice(result: ToolResult, projectPath?: string): ToolResult {
     if (result.isError) return result;
 
+    if (this.projectProvider) {
+      try {
+        const freshness = this.projectProvider.getFreshness(projectPath);
+        if (freshness.stale || freshness.degradedReason) {
+          const [head, ...tail] = result.content;
+          if (!head || head.type !== 'text') return result;
+          const notice = freshness.degradedReason
+            ? formatDegradedBanner(freshness.degradedReason)
+            : '⚠ CodeGraph workspace reconciliation is still running; this result may be stale. Read referenced files directly when exact current content matters.';
+          return {
+            ...result,
+            content: [{ type: 'text', text: `${notice}\n\n${head.text}` }, ...tail],
+          };
+        }
+      } catch {
+        // Provider freshness is advisory; the graph result remains usable.
+      }
+    }
+
     let cg: CodeGraph;
     try {
       cg = this.getCodeGraph(projectPath);
@@ -1352,6 +1413,7 @@ export class ToolHandler {
    * Execute a tool by name
    */
   async execute(toolName: string, args: Record<string, unknown>): Promise<ToolResult> {
+    let preparedHandle: ProjectHandle | null = null;
     try {
       // Block the first tool call on the engine's post-open reconcile so we
       // never serve rows for files deleted/edited while no MCP server was
@@ -1390,6 +1452,131 @@ export class ToolHandler {
         if (typeof check === 'object' && check !== undefined) return check;
       }
 
+      if (this.projectProvider) {
+        const additional = this.projectProvider.getAdditionalTools?.() ?? [];
+        if (additional.some((tool) => tool.name === toolName)) {
+          const result = await this.projectProvider.executeAdditionalTool?.(toolName, args);
+          if (result) return result;
+          return this.errorResult(`Workspace provider did not handle tool ${toolName}`);
+        }
+
+        preparedHandle = await this.projectProvider.prepare(
+          args.projectPath as string | undefined,
+        );
+        const result = await this.preparedProject.run(
+          preparedHandle,
+          () => this.executePreparedTool(toolName, args),
+        );
+        return this.redactProviderStorageResult(result, preparedHandle);
+      }
+
+      return await this.executePreparedTool(toolName, args);
+    } catch (err) {
+      // Expected condition, not a malfunction: answer as a SUCCESS so the
+      // agent keeps trusting the toolset for projects that ARE indexed.
+      // (An isError here teaches session-long abandonment — see NotIndexedError.)
+      if (
+        err instanceof NotIndexedError ||
+        (
+          typeof err === 'object' &&
+          err !== null &&
+          'code' in err &&
+          (
+            err.code === 'PROJECT_NOT_REGISTERED' ||
+            err.code === 'PROJECT_NOT_INDEXED' ||
+            err.code === 'PROJECT_DISABLED'
+          )
+        )
+      ) {
+        return this.textResult(this.redactProviderStorageError(
+          err instanceof Error ? err.message : String(err),
+          preparedHandle,
+        ));
+      }
+      // Security refusal: a clean error, no retry encouragement.
+      if (err instanceof PathRefusalError) {
+        return this.errorResult(
+          this.redactProviderStorageError(err.message, preparedHandle),
+        );
+      }
+      const publicErrorMessage = this.redactProviderStorageError(
+        err instanceof Error ? err.message : String(err),
+        preparedHandle,
+      );
+      return this.errorResult(
+        `Tool execution failed: ${publicErrorMessage}. ` +
+        'This is an internal codegraph error — retry the call once; if it persists, ' +
+        'continue without codegraph for this task.'
+      );
+    } finally {
+      if (preparedHandle && this.projectProvider?.release) {
+        try {
+          this.projectProvider.release(preparedHandle);
+        } catch {
+          // A provider release is best-effort cleanup after the result is
+          // already complete. Provider.close() is the final safety net.
+        }
+      }
+    }
+  }
+
+  /**
+   * Workspace providers may route to external databases, but MCP clients only
+   * address source `projectPath` values. Replace a result only when it contains
+   * the exact private generation path; ordinary queried source remains intact.
+   */
+  private redactProviderStorageResult(
+    result: ToolResult,
+    handle: ProjectHandle,
+  ): ToolResult {
+    const dataDir = handle.location.dataDir;
+    if (
+      !dataDir
+      || !result.content.some((item) =>
+        this.containsPrivateStoragePath(item.text, dataDir))
+    ) {
+      return result;
+    }
+    return this.errorResult(
+      'Tool execution failed in workspace-managed index storage. '
+      + 'Inspect the CodeGraph workspace daemon logs and retry once.',
+    );
+  }
+
+  private redactProviderStorageError(
+    message: string,
+    handle: ProjectHandle | null,
+  ): string {
+    const dataDir = handle?.location.dataDir;
+    if (
+      (dataDir && this.containsPrivateStoragePath(message, dataDir))
+      || /[\\/]\.workspace[\\/]codegraph[\\/](?:indexes|state|runtime)[\\/]/iu
+        .test(message)
+    ) {
+      return 'Workspace-managed index storage failed; inspect daemon logs';
+    }
+    return message;
+  }
+
+  private containsPrivateStoragePath(text: string, dataDir: string): boolean {
+    const normalize = (value: string): string => {
+      const normalized = value.replace(/\\/gu, '/');
+      return process.platform === 'win32'
+        ? normalized.toLocaleLowerCase('en-US')
+        : normalized;
+    };
+    return normalize(text).includes(normalize(dataDir));
+  }
+
+  /**
+   * Dispatch after a provider has prepared and pinned one immutable project
+   * generation for the whole request. AsyncLocalStorage makes every in-process
+   * graph lookup in a multi-step tool resolve to that same handle.
+   */
+  private async executePreparedTool(
+    toolName: string,
+    args: Record<string, unknown>,
+  ): Promise<ToolResult> {
       // codegraph_status reports watcher state (pending files, degraded mode,
       // worktree warning) and embeds its own sections — it must run on the MAIN
       // thread against the watched default instance, so it is NEVER off-loaded to
@@ -1413,28 +1600,21 @@ export class ToolHandler {
       // cross-cutting notices — worktree-index mismatch (#155) and per-file
       // staleness (#403) — which need the watched MAIN instance and so are
       // always applied here, never in the worker.
+      const prepared = this.preparedProject.getStore();
+      const poolTarget: QueryProjectDescriptor | undefined =
+        prepared?.location.dataDir
+          ? {
+            projectId: prepared.projectId,
+            generationId: prepared.generationId,
+            projectRoot: prepared.location.projectRoot,
+            dataDir: prepared.location.dataDir,
+          }
+          : undefined;
       const result = (this.queryPool && this.queryPool.healthy && this.queryPool.ready)
-        ? await this.queryPool.run(toolName, args)
+        ? await this.queryPool.run(toolName, args, poolTarget)
         : await this.executeReadTool(toolName, args);
       const withWorktree = this.withWorktreeNotice(result, args.projectPath as string | undefined);
       return this.withStalenessNotice(withWorktree, args.projectPath as string | undefined);
-    } catch (err) {
-      // Expected condition, not a malfunction: answer as a SUCCESS so the
-      // agent keeps trusting the toolset for projects that ARE indexed.
-      // (An isError here teaches session-long abandonment — see NotIndexedError.)
-      if (err instanceof NotIndexedError) {
-        return this.textResult(err.message);
-      }
-      // Security refusal: a clean error, no retry encouragement.
-      if (err instanceof PathRefusalError) {
-        return this.errorResult(err.message);
-      }
-      return this.errorResult(
-        `Tool execution failed: ${err instanceof Error ? err.message : String(err)}. ` +
-        'This is an internal codegraph error — retry the call once; if it persists, ' +
-        'continue without codegraph for this task.'
-      );
-    }
   }
 
   /**
@@ -4088,6 +4268,29 @@ export class ToolHandler {
       `**Total edges:** ${stats.edgeCount}`,
       `**Database size:** ${(stats.dbSizeBytes / 1024 / 1024).toFixed(2)} MB`,
     );
+
+    if (this.projectProvider) {
+      try {
+        const freshness = this.projectProvider.getFreshness(
+          args.projectPath as string | undefined,
+        );
+        lines.push(
+          `**Runtime state:** ${freshness.state}`,
+          `**Last successful sync:** ${
+            freshness.lastSuccessfulSyncAt === null
+              ? 'never'
+              : new Date(freshness.lastSuccessfulSyncAt).toISOString()
+          }`,
+          `**Workspace pending files:** ${freshness.pendingFiles}`,
+        );
+        if (freshness.stale) lines.push('**Freshness:** ⚠ reconciliation pending');
+        if (freshness.degradedReason) {
+          lines.push(`**Workspace degradation:** ⚠ ${freshness.degradedReason}`);
+        }
+      } catch {
+        // Provider status is advisory; retain the core database status below.
+      }
+    }
 
     // Surface the active SQLite backend (node:sqlite, Node's built-in real
     // SQLite — full WAL + FTS5, no native build).

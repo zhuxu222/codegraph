@@ -27,6 +27,7 @@ import { Worker } from 'worker_threads';
 import * as path from 'path';
 import * as os from 'os';
 import type { ToolResult } from './tools';
+import { findNearestCodeGraphRoot, getCodeGraphDir } from '../directory';
 
 /** Compiled sibling — `query-worker.js` lives next to this file in `dist/mcp/`. */
 const WORKER_FILE = path.join(__dirname, 'query-worker.js');
@@ -73,24 +74,72 @@ const MAX_CONCURRENT_SPAWN = 2;
 interface WorkerMessage {
   type?: string;
   ok?: boolean;
+  error?: string;
   id?: number;
+  drainId?: number;
   result?: ToolResult;
+}
+
+export interface QueryGenerationLease {
+  release(): void;
 }
 
 interface Job {
   id: number;
   toolName: string;
   args: Record<string, unknown>;
+  project: QueryProjectDescriptor;
+  /** A provider already acquired a lease for this exact immutable generation. */
+  pinnedGeneration: boolean;
   resolve: (r: ToolResult) => void;
   retries: number;
   settled: boolean;
+  state: 'queued' | 'inflight' | 'finished';
+  generationLease?: QueryGenerationLease;
   enqueuedAt: number;
   softTimer?: NodeJS.Timeout;
+}
+
+interface WorkerDrain {
+  remaining: Set<PoolWorker>;
+  resolve: () => void;
+  reject: (error: Error) => void;
+}
+
+/**
+ * Immutable index generation a query worker can open.
+ *
+ * `projectRoot` is always the source tree. `dataDir` is the generation's
+ * CodeGraph data directory and may live anywhere (for example under a
+ * workspace-owned cache). The tuple `(projectId, generationId)` is the worker
+ * cache key; paths are deliberately not used as identity so repository renames
+ * do not alias generations.
+ */
+export interface QueryProjectDescriptor {
+  projectId: string;
+  generationId: string;
+  projectRoot: string;
+  dataDir: string;
+}
+
+/** Versioned snapshot of the generations that should receive new queries. */
+export interface QueryCatalogSnapshot {
+  revision: number;
+  projects: QueryProjectDescriptor[];
+  /** Omit for a workspace root that intentionally has no default project. */
+  defaultProjectId?: string;
 }
 
 export interface QueryPoolOptions {
   /** Default project root each worker opens at spawn. */
   root: string;
+  /**
+   * Explicit default generation. Omit for the legacy single-project layout,
+   * which is represented as `<root>/<CODEGRAPH_DIR || ".codegraph">`.
+   */
+  defaultProject?: QueryProjectDescriptor;
+  /** Optional initial multi-project catalog. */
+  catalog?: QueryCatalogSnapshot;
   /** Max worker threads. Defaults to `clamp(cores-1, 1, 16)`. */
   size?: number;
   /** Linger before a queued call gets busy-guidance. Default 45s. */
@@ -99,6 +148,15 @@ export interface QueryPoolOptions {
   maxRetries?: number;
   /** Worker factory (tests inject a fake). Defaults to a real `worker_threads` Worker. */
   createWorker?: () => PoolWorker;
+  /**
+   * Optional manager-owned generation lease. The pool acquires it immediately
+   * before dispatching a worker call and releases it only when worker execution
+   * actually ends (result, terminal crash, or destroy). A client-facing soft
+   * timeout does not release this lease.
+   */
+  acquireGenerationLease?: (
+    project: QueryProjectDescriptor,
+  ) => QueryGenerationLease | null;
 }
 
 /**
@@ -144,6 +202,7 @@ export class QueryPool {
   private queue: Job[] = [];
   private inflight = new Map<PoolWorker, Job>();
   private workers = new Set<PoolWorker>();
+  private terminatingWorkers = new Set<PoolWorker>();
   // Workers spawned but not yet 'ready'. Growth must count these so a single
   // first call (with the eager worker still starting) doesn't spawn the WHOLE
   // pool at once — N simultaneous cold worker starts (each a full module load +
@@ -151,20 +210,51 @@ export class QueryPool {
   // the queue outstrips idle + pending.
   private pendingWorkers = new Set<PoolWorker>();
   private nextId = 1;
+  private nextDrainId = 1;
   private totalCrashes = 0;
   private destroyed = false;
   private readonly root: string;
+  private readonly legacyProject: QueryProjectDescriptor;
+  private catalog = new Map<string, QueryProjectDescriptor>();
+  private catalogRevisionValue = 0;
+  private defaultProjectId: string | null;
+  private catalogManaged = false;
   private readonly maxSize: number;
   private readonly softTimeoutMs: number;
   private readonly maxRetries: number;
   private readonly createWorker: () => PoolWorker;
+  private readonly acquireGenerationLease:
+    ((project: QueryProjectDescriptor) => QueryGenerationLease | null) | null;
+  private readonly generationDrainStates =
+    new Map<string, 'draining' | 'drained'>();
+  private readonly generationDrains = new Map<string, Promise<void>>();
+  private readonly generationDrainTokens = new Map<string, symbol>();
+  private readonly generationJobWaiters =
+    new Map<string, Set<() => void>>();
+  private readonly workerDrains = new Map<number, WorkerDrain>();
 
   constructor(opts: QueryPoolOptions) {
     this.root = opts.root;
+    this.legacyProject = opts.defaultProject ?? {
+      projectId: 'legacy',
+      generationId: 'legacy',
+      projectRoot: this.root,
+      dataDir: getCodeGraphDir(this.root),
+    };
+    this.catalogManaged = opts.defaultProject !== undefined;
+    this.defaultProjectId = this.legacyProject.projectId;
+    this.catalog.set(this.legacyProject.projectId, this.legacyProject);
+    if (opts.catalog) this.applyCatalog(opts.catalog);
     this.maxSize = Math.max(1, Math.min(opts.size ?? Math.max(1, os.cpus().length - 1), MAX_POOL_SIZE));
     this.softTimeoutMs = opts.softTimeoutMs ?? resolveBusyTimeoutMs();
     this.maxRetries = opts.maxRetries ?? 1;
-    this.createWorker = opts.createWorker ?? (() => new Worker(WORKER_FILE, { workerData: { root: this.root } }));
+    this.acquireGenerationLease = opts.acquireGenerationLease ?? null;
+    this.createWorker = opts.createWorker ?? (() => new Worker(WORKER_FILE, {
+      workerData: {
+        root: this.root,
+        defaultProject: this.getWorkerDefaultProject(),
+      },
+    }));
     this.spawnOne(); // one eager warm worker, ready for the first call
   }
 
@@ -173,6 +263,9 @@ export class QueryPool {
 
   /** Live worker count (for tests/status). */
   get liveWorkers(): number { return this.workers.size; }
+
+  /** Catalog revision currently used to route newly-enqueued calls. */
+  get catalogRevision(): number { return this.catalogRevisionValue; }
 
   /**
    * False once the crash budget is exhausted (or after destroy). The ToolHandler
@@ -200,6 +293,376 @@ export class QueryPool {
   }
   private everReady = false;
 
+  /**
+   * Replace the active-generation catalog. Stale/equal revisions are ignored,
+   * which makes reconnect/replay of controller notifications idempotent.
+   *
+   * Existing in-flight jobs keep their captured descriptor. Queued jobs are not
+   * in flight yet, so they are rebound to the newly-active generation.
+   */
+  setCatalog(snapshot: QueryCatalogSnapshot): void {
+    if (
+      this.destroyed ||
+      snapshot.revision < this.catalogRevisionValue ||
+      (this.catalogManaged && snapshot.revision === this.catalogRevisionValue)
+    ) return;
+    this.applyCatalog(snapshot);
+    this.broadcastCatalog();
+  }
+
+  /** Alias used by controllers that call their operation an update. */
+  updateCatalog(snapshot: QueryCatalogSnapshot): void {
+    this.setCatalog(snapshot);
+  }
+
+  /**
+   * Atomically route future/queued queries for one project to a new immutable
+   * generation, then tell every worker to retire the prior cached generation.
+   */
+  promote(project: QueryProjectDescriptor, revision = this.catalogRevisionValue + 1): void {
+    if (this.destroyed || revision <= this.catalogRevisionValue) return;
+    this.assertDescriptor(project);
+    const previous = this.catalog.get(project.projectId);
+    this.catalogManaged = true;
+    this.catalog.set(project.projectId, project);
+    this.clearGenerationDrain(project);
+    this.catalogRevisionValue = revision;
+    this.retargetQueuedJobs(project);
+    this.broadcast({
+      type: 'promote',
+      revision,
+      project,
+      previousGenerationId: previous?.generationId,
+    });
+  }
+
+  /**
+   * Retire cached connections. With a generation id only that immutable
+   * generation is invalidated; without one every generation for the project is
+   * retired. In-flight calls finish before the worker closes their connection.
+   */
+  invalidate(projectId: string, generationId?: string): void {
+    if (this.destroyed) return;
+    const active = this.catalog.get(projectId);
+    if (!generationId || active?.generationId === generationId) {
+      this.catalog.delete(projectId);
+      if (this.defaultProjectId === projectId) this.defaultProjectId = null;
+      for (const job of [...this.queue]) {
+      if (!job.settled && job.project.projectId === projectId) {
+          this.queue = this.queue.filter((candidate) => candidate !== job);
+          this.settle(job, {
+            isError: true,
+            content: [{
+              type: 'text',
+              text: `CodeGraph generation for project "${projectId}" was invalidated; retry after the catalog refreshes.`,
+            }],
+          });
+          this.finishWork(job);
+        }
+      }
+    }
+    this.broadcast({ type: 'invalidate', projectId, generationId });
+    this.drain();
+  }
+
+  /**
+   * Stop dispatching one inactive generation, wait for every already-dispatched
+   * call to finish, then invalidate that generation in every live worker and
+   * wait for explicit acknowledgements. This is the deletion barrier used by
+   * generation managers before removing SQLite/WAL files (especially on
+   * Windows, where an idle worker handle otherwise prevents deletion).
+   *
+   * Client-facing soft timeouts do not complete this barrier: an in-flight job
+   * remains tracked until its worker returns or terminates.
+   */
+  drainGeneration(projectId: string, generationId: string): Promise<void> {
+    if (this.destroyed) return Promise.resolve();
+    if (!projectId || !generationId) {
+      return Promise.reject(
+        new Error('projectId and generationId are required to drain a generation'),
+      );
+    }
+    const key = generationKey(projectId, generationId);
+    const existing = this.generationDrains.get(key);
+    if (existing) return existing;
+    if (this.generationDrainStates.get(key) === 'drained') {
+      return Promise.resolve();
+    }
+
+    const token = Symbol(key);
+    this.generationDrainStates.set(key, 'draining');
+    this.generationDrainTokens.set(key, token);
+    let operation!: Promise<void>;
+    operation = this.performGenerationDrain(
+      key,
+      token,
+      projectId,
+      generationId,
+    )
+      .then(() => {
+        if (
+          this.generationDrainTokens.get(key) === token
+          && this.generationDrainStates.get(key) === 'draining'
+        ) {
+          this.generationDrainStates.set(key, 'drained');
+        }
+      })
+      .catch((error: unknown) => {
+        if (
+          this.generationDrainTokens.get(key) === token
+          && this.generationDrainStates.get(key) === 'draining'
+        ) {
+          this.generationDrainStates.delete(key);
+        }
+        throw error;
+      })
+      .finally(() => {
+        if (this.generationDrains.get(key) === operation) {
+          this.generationDrains.delete(key);
+        }
+        if (this.generationDrainTokens.get(key) === token) {
+          this.generationDrainTokens.delete(key);
+        }
+      });
+    this.generationDrains.set(key, operation);
+    return operation;
+  }
+
+  private applyCatalog(snapshot: QueryCatalogSnapshot): void {
+    const previousIds = new Set(this.catalog.keys());
+    const next = new Map<string, QueryProjectDescriptor>();
+    for (const project of snapshot.projects) {
+      this.assertDescriptor(project);
+      if (next.has(project.projectId)) {
+        throw new Error(`Duplicate query catalog project id "${project.projectId}"`);
+      }
+      next.set(project.projectId, project);
+      this.clearGenerationDrain(project);
+      previousIds.delete(project.projectId);
+    }
+    if (snapshot.defaultProjectId && !next.has(snapshot.defaultProjectId)) {
+      throw new Error(`Query catalog default project "${snapshot.defaultProjectId}" is not present`);
+    }
+    this.catalogManaged = true;
+    this.catalog = next;
+    this.catalogRevisionValue = snapshot.revision;
+    this.defaultProjectId = snapshot.defaultProjectId ?? null;
+    for (const project of next.values()) this.retargetQueuedJobs(project);
+    if (previousIds.size > 0 && this.queue.length > 0) {
+      const retained: Job[] = [];
+      for (const job of this.queue) {
+        if (!job.settled && previousIds.has(job.project.projectId)) {
+          this.settle(job, {
+            isError: true,
+            content: [{
+              type: 'text',
+              text: `CodeGraph project "${job.project.projectId}" was removed from the catalog; retry with a registered project.`,
+            }],
+          });
+          this.finishWork(job);
+        } else {
+          retained.push(job);
+        }
+      }
+      this.queue = retained;
+    }
+  }
+
+  private assertDescriptor(project: QueryProjectDescriptor): void {
+    for (const field of ['projectId', 'generationId', 'projectRoot', 'dataDir'] as const) {
+      const value = project[field];
+      if (typeof value !== 'string' || value.length === 0) {
+        throw new Error(`Invalid query project descriptor field "${field}"`);
+      }
+    }
+  }
+
+  private retargetQueuedJobs(project: QueryProjectDescriptor): void {
+    for (const job of this.queue) {
+      if (
+        !job.settled &&
+        !job.pinnedGeneration &&
+        job.project.projectId === project.projectId
+      ) {
+        job.project = project;
+      }
+    }
+  }
+
+  private clearGenerationDrain(project: QueryProjectDescriptor): void {
+    const key = generationKey(project.projectId, project.generationId);
+    this.generationDrainStates.delete(key);
+    this.generationDrainTokens.delete(key);
+    this.generationDrains.delete(key);
+    this.maybeResolveGenerationWaiters(key);
+  }
+
+  private async performGenerationDrain(
+    key: string,
+    token: symbol,
+    projectId: string,
+    generationId: string,
+  ): Promise<void> {
+    const retained: Job[] = [];
+    for (const job of this.queue) {
+      if (generationKeyFor(job.project) !== key) {
+        retained.push(job);
+        continue;
+      }
+      if (!job.settled) {
+        this.settle(job, {
+          isError: true,
+          content: [{
+            type: 'text',
+            text:
+              `CodeGraph generation ${projectId}/${generationId} is being retired; `
+              + 'retry the call against the active generation.',
+          }],
+        });
+      }
+      this.finishWork(job);
+    }
+    this.queue = retained;
+    this.drain();
+
+    await this.waitForGenerationJobs(key);
+    // A rollback/catalog activation can cancel a pending drain while it waits
+    // for an old worker call. In that case do not invalidate the active target.
+    if (this.destroyed) return;
+    if (
+      this.generationDrainTokens.get(key) !== token
+      || this.generationDrainStates.get(key) !== 'draining'
+    ) {
+      throw new Error(
+        `CodeGraph generation drain for ${projectId}/${generationId} `
+        + 'was canceled by catalog reactivation.',
+      );
+    }
+    await this.requestWorkerDrain(projectId, generationId);
+    if (
+      !this.destroyed
+      && (
+        this.generationDrainTokens.get(key) !== token
+        || this.generationDrainStates.get(key) !== 'draining'
+      )
+    ) {
+      throw new Error(
+        `CodeGraph generation drain for ${projectId}/${generationId} `
+        + 'was canceled by catalog reactivation.',
+      );
+    }
+  }
+
+  private waitForGenerationJobs(key: string): Promise<void> {
+    if (!this.hasGenerationWork(key)) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      const waiters = this.generationJobWaiters.get(key) ?? new Set();
+      waiters.add(resolve);
+      this.generationJobWaiters.set(key, waiters);
+    });
+  }
+
+  private hasGenerationWork(key: string): boolean {
+    return (
+      this.queue.some(
+        (job) =>
+          job.state !== 'finished'
+          && generationKeyFor(job.project) === key,
+      )
+      || [...this.inflight.values()].some(
+        (job) =>
+          job.state !== 'finished'
+          && generationKeyFor(job.project) === key,
+      )
+    );
+  }
+
+  private maybeResolveGenerationWaiters(key: string): void {
+    if (
+      this.generationDrainStates.get(key) === 'draining'
+      && this.hasGenerationWork(key)
+    ) {
+      return;
+    }
+    const waiters = this.generationJobWaiters.get(key);
+    if (!waiters) return;
+    this.generationJobWaiters.delete(key);
+    for (const resolve of waiters) resolve();
+  }
+
+  private requestWorkerDrain(
+    projectId: string,
+    generationId: string,
+  ): Promise<void> {
+    const workers = new Set(this.workers);
+    if (workers.size === 0) return Promise.resolve();
+    const drainId = this.nextDrainId++;
+    return new Promise<void>((resolve, reject) => {
+      this.workerDrains.set(drainId, { remaining: workers, resolve, reject });
+      for (const worker of [...workers]) {
+        try {
+          worker.postMessage({
+            type: 'drain',
+            drainId,
+            projectId,
+            generationId,
+          });
+        } catch {
+          this.terminateFailedWorker(worker);
+        }
+      }
+      this.maybeResolveWorkerDrain(drainId);
+    });
+  }
+
+  private maybeResolveWorkerDrain(drainId: number): void {
+    const drain = this.workerDrains.get(drainId);
+    if (!drain || drain.remaining.size > 0) return;
+    this.workerDrains.delete(drainId);
+    drain.resolve();
+  }
+
+  private removeWorkerFromDrains(worker: PoolWorker): void {
+    for (const [drainId, drain] of this.workerDrains) {
+      drain.remaining.delete(worker);
+      this.maybeResolveWorkerDrain(drainId);
+    }
+  }
+
+  private getDefaultProject(): QueryProjectDescriptor | null {
+    return this.defaultProjectId ? this.catalog.get(this.defaultProjectId) ?? null : null;
+  }
+
+  private getWorkerDefaultProject(): QueryProjectDescriptor | undefined {
+    const project = this.catalogManaged
+      ? this.getDefaultProject()
+      : this.legacyProject;
+    if (
+      project === null
+      || this.generationDrainStates.has(generationKeyFor(project))
+    ) {
+      return undefined;
+    }
+    return project;
+  }
+
+  private broadcastCatalog(worker?: PoolWorker): void {
+    const message = {
+      type: 'catalog',
+      revision: this.catalogRevisionValue,
+      projects: [...this.catalog.values()],
+      defaultProjectId: this.defaultProjectId ?? undefined,
+    };
+    if (worker) worker.postMessage(message);
+    else this.broadcast(message);
+  }
+
+  private broadcast(message: unknown): void {
+    for (const worker of this.workers) {
+      try { worker.postMessage(message); } catch { /* worker exit path handles it */ }
+    }
+  }
+
   private spawnOne(): void {
     if (this.destroyed || this.workers.size >= this.maxSize) return;
     let w: PoolWorker;
@@ -212,16 +675,40 @@ export class QueryPool {
     this.workers.add(w);
     this.pendingWorkers.add(w);
     w.on('message', (m) => this.onMessage(w, (m ?? {}) as WorkerMessage));
-    w.on('error', () => this.onWorkerGone(w));
-    w.on('exit', (code) => { if (code !== 0) this.onWorkerGone(w); });
+    w.on('error', () => this.terminateFailedWorker(w));
+    // Any unrequested exit removes the worker from generation-drain barriers.
+    // destroy() clears `workers` first, so expected termination is ignored.
+    w.on('exit', () => this.onWorkerGone(w));
   }
 
   private onMessage(w: PoolWorker, m: WorkerMessage): void {
-    if (!m) return;
+    if (
+      !m
+      || !this.workers.has(w)
+      || this.terminatingWorkers.has(w)
+    ) return;
+    if (m.type === 'drained' && typeof m.drainId === 'number') {
+      const drain = this.workerDrains.get(m.drainId);
+      if (!drain || !drain.remaining.has(w)) return;
+      if (m.ok === false) {
+        this.workerDrains.delete(m.drainId);
+        drain.reject(new Error(
+          m.error
+            ?? 'CodeGraph query worker could not close a drained generation',
+        ));
+        return;
+      }
+      drain.remaining.delete(w);
+      this.maybeResolveWorkerDrain(m.drainId);
+      return;
+    }
     if (m.type === 'ready') {
       this.pendingWorkers.delete(w);
       if (m.ok === false) this.totalCrashes++; // hard open failure
       else this.everReady = true;
+      // A worker may have spent seconds cold-starting while promotions happened.
+      // Seed it with the latest catalog before it can receive a queued call.
+      this.broadcastCatalog(w);
       this.idle.push(w);
       this.drain();
       return;
@@ -230,7 +717,10 @@ export class QueryPool {
       const job = this.inflight.get(w);
       this.inflight.delete(w);
       this.idle.push(w);
-      if (job) this.settle(job, m.result ?? busyGuidance(0));
+      if (job) {
+        this.settle(job, m.result ?? busyGuidance(0));
+        this.finishWork(job);
+      }
       this.drain();
     }
   }
@@ -238,22 +728,66 @@ export class QueryPool {
   // A worker died (crash hook, OOM, segfault, exit≠0). Respawn a replacement and
   // retry its in-flight job once; a job that keeps crashing workers fails
   // gracefully so it can't loop the pool forever.
+  /**
+   * An `error` event or a failed postMessage does not itself prove that the
+   * worker thread (and its SQLite handles) is gone. Keep it in every drain
+   * barrier until termination completes or the worker emits `exit`.
+   */
+  private terminateFailedWorker(w: PoolWorker): void {
+    if (
+      !this.workers.has(w)
+      || this.terminatingWorkers.has(w)
+    ) return;
+    this.terminatingWorkers.add(w);
+    this.pendingWorkers.delete(w);
+    this.idle = this.idle.filter((candidate) => candidate !== w);
+    void (async () => {
+      try {
+        await w.terminate();
+      } catch {
+        // exit/finalization still owns cleanup
+      } finally {
+        this.terminatingWorkers.delete(w);
+        this.onWorkerGone(w);
+      }
+    })();
+  }
+
   private onWorkerGone(w: PoolWorker): void {
     if (!this.workers.has(w)) return; // already handled (error+exit both fire)
     this.workers.delete(w);
+    this.terminatingWorkers.delete(w);
     this.pendingWorkers.delete(w);
     this.idle = this.idle.filter((x) => x !== w);
+    this.removeWorkerFromDrains(w);
     this.totalCrashes++;
     const job = this.inflight.get(w);
     this.inflight.delete(w);
-    try { void w.terminate(); } catch { /* already gone */ }
     if (this.healthy) this.spawnOne(); // keep capacity
     if (job) {
-      if (job.retries < this.maxRetries && this.healthy) {
+      const draining =
+        this.generationDrainStates.get(generationKeyFor(job.project))
+        === 'draining';
+      if (
+        !job.settled
+        && !draining
+        && job.retries < this.maxRetries
+        && this.healthy
+      ) {
         job.retries++;
+        job.state = 'queued';
         this.queue.unshift(job); // head of line — retry promptly
       } else {
-        this.settle(job, { isError: true, content: [{ type: 'text', text: 'codegraph worker crashed; please retry the call.' }] });
+        this.settle(job, {
+          isError: true,
+          content: [{
+            type: 'text',
+            text: draining
+              ? 'codegraph generation is being retired; retry the call.'
+              : 'codegraph worker crashed; please retry the call.',
+          }],
+        });
+        this.finishWork(job);
       }
     }
     this.drain();
@@ -274,11 +808,73 @@ export class QueryPool {
     while (this.idle.length && this.queue.length) {
       // Skip jobs the backstop already answered.
       let job: Job | undefined;
-      while (this.queue.length && (job = this.queue.shift()) && job.settled) job = undefined;
+      while (this.queue.length && (job = this.queue.shift()) && job.settled) {
+        this.finishWork(job);
+        job = undefined;
+      }
       if (!job || job.settled) break;
+      const generationKey = generationKeyFor(job.project);
+      if (this.generationDrainStates.has(generationKey)) {
+        this.settle(job, {
+          isError: true,
+          content: [{
+            type: 'text',
+            text:
+              'CodeGraph generation is being retired; '
+              + 'retry against the active generation.',
+          }],
+        });
+        this.finishWork(job);
+        continue;
+      }
+      if (!job.generationLease && this.acquireGenerationLease) {
+        try {
+          const lease = this.acquireGenerationLease(job.project);
+          if (lease === null) {
+            this.settle(job, {
+              isError: true,
+              content: [{
+                type: 'text',
+                text:
+                  'CodeGraph generation is no longer available; '
+                  + 'retry against the active generation.',
+              }],
+            });
+            this.finishWork(job);
+            continue;
+          }
+          job.generationLease = lease;
+        } catch (error) {
+          this.settle(job, {
+            isError: true,
+            content: [{
+              type: 'text',
+              text:
+                `Could not lease CodeGraph generation: ${
+                  error instanceof Error ? error.message : String(error)
+                }`,
+            }],
+          });
+          this.finishWork(job);
+          continue;
+        }
+      }
       const w = this.idle.pop()!;
+      job.state = 'inflight';
       this.inflight.set(w, job);
-      w.postMessage({ type: 'call', id: job.id, toolName: job.toolName, args: job.args });
+      try {
+        w.postMessage({
+          type: 'call',
+          id: job.id,
+          toolName: job.toolName,
+          args: job.args,
+          project: job.project,
+          pinnedGeneration: job.pinnedGeneration,
+          catalogRevision: this.catalogRevisionValue,
+        });
+      } catch {
+        this.terminateFailedWorker(w);
+      }
     }
   }
 
@@ -289,23 +885,119 @@ export class QueryPool {
     job.resolve(result);
   }
 
-  /** Run a read tool on the pool. Always resolves (never rejects). */
-  run(toolName: string, args: Record<string, unknown>): Promise<ToolResult> {
+  private finishWork(job: Job): void {
+    if (job.state === 'finished') return;
+    job.state = 'finished';
+    const lease = job.generationLease;
+    job.generationLease = undefined;
+    if (lease) {
+      try { lease.release(); } catch { /* lease owner remains authoritative */ }
+    }
+    this.maybeResolveGenerationWaiters(generationKeyFor(job.project));
+  }
+
+  /**
+   * Run a read tool on the pool. Always resolves (never rejects).
+   *
+   * The optional target may be a complete descriptor (useful before publishing
+   * it into a catalog) or a registered project id. Without it, `projectPath` is
+   * longest-prefix matched against the catalog; otherwise the catalog default
+   * is used. Legacy pools keep routing to their original single root.
+   */
+  run(
+    toolName: string,
+    args: Record<string, unknown>,
+    target?: QueryProjectDescriptor | string,
+  ): Promise<ToolResult> {
     return new Promise<ToolResult>((resolve) => {
+      if (this.destroyed) {
+        resolve({
+          isError: true,
+          content: [{
+            type: 'text',
+            text: 'codegraph is shutting down; retry shortly.',
+          }],
+        });
+        return;
+      }
+      const project = this.resolveProject(args, target);
+      if (!project) {
+        resolve({
+          isError: true,
+          content: [{
+            type: 'text',
+            text: 'No registered CodeGraph project matches this query. Pass a registered projectPath.',
+          }],
+        });
+        return;
+      }
       const job: Job = {
-        id: this.nextId++, toolName, args, resolve,
-        retries: 0, settled: false, enqueuedAt: Date.now(),
+        id: this.nextId++, toolName, args, project, resolve,
+        pinnedGeneration: typeof target === 'object' && target !== null,
+        retries: 0, settled: false, state: 'queued', enqueuedAt: Date.now(),
       };
       // Don't let the caller wait past softTimeoutMs. The worker may still be
       // busy (we can't cancel synchronous CPU), but the CLIENT gets a prompt,
       // success-shaped "retry" instead of a hard timeout.
       job.softTimer = setTimeout(() => {
-        if (!job.settled) this.settle(job, busyGuidance(Date.now() - job.enqueuedAt));
+        if (job.settled) return;
+        this.settle(job, busyGuidance(Date.now() - job.enqueuedAt));
+        if (job.state === 'queued') {
+          this.queue = this.queue.filter((candidate) => candidate !== job);
+          this.finishWork(job);
+          this.drain();
+        }
       }, this.softTimeoutMs);
       job.softTimer.unref?.();
       this.queue.push(job);
       this.drain();
     });
+  }
+
+  private resolveProject(
+    args: Record<string, unknown>,
+    target?: QueryProjectDescriptor | string,
+  ): QueryProjectDescriptor | null {
+    if (typeof target === 'object' && target !== null) {
+      this.assertDescriptor(target);
+      return target;
+    }
+    if (typeof target === 'string') return this.catalog.get(target) ?? null;
+
+    const requestedPath = typeof args.projectPath === 'string'
+      ? path.resolve(args.projectPath)
+      : null;
+    if (requestedPath && !this.catalogManaged) {
+      const projectRoot = findNearestCodeGraphRoot(requestedPath);
+      if (!projectRoot) return null;
+      const canonicalRoot = path.resolve(projectRoot);
+      const identityRoot = process.platform === 'win32'
+        ? canonicalRoot.toLowerCase()
+        : canonicalRoot;
+      return {
+        projectId: `legacy:${identityRoot}`,
+        generationId: 'legacy',
+        projectRoot: canonicalRoot,
+        dataDir: getCodeGraphDir(canonicalRoot),
+      };
+    }
+    if (requestedPath && this.catalogManaged) {
+      const foldedRequested = process.platform === 'win32'
+        ? requestedPath.toLowerCase()
+        : requestedPath;
+      let best: QueryProjectDescriptor | null = null;
+      for (const project of this.catalog.values()) {
+        const root = path.resolve(project.projectRoot);
+        const foldedRoot = process.platform === 'win32' ? root.toLowerCase() : root;
+        const relative = path.relative(foldedRoot, foldedRequested);
+        if (relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))) {
+          if (!best || root.length > path.resolve(best.projectRoot).length) best = project;
+        }
+      }
+      return best;
+    }
+
+    return this.getDefaultProject() ?? (this.catalogManaged ? null : this.legacyProject);
   }
 
   /** Terminate all workers and answer any outstanding calls gracefully. */
@@ -314,13 +1006,42 @@ export class QueryPool {
     this.destroyed = true;
     const ws = [...this.workers];
     this.workers.clear();
+    this.terminatingWorkers.clear();
     this.pendingWorkers.clear();
     this.idle = [];
-    for (const job of [...this.inflight.values(), ...this.queue]) {
+    const outstanding = [...this.inflight.values(), ...this.queue];
+    for (const job of outstanding) {
       this.settle(job, { isError: true, content: [{ type: 'text', text: 'codegraph is shutting down; retry shortly.' }] });
     }
     this.inflight.clear();
     this.queue = [];
-    await Promise.all(ws.map((w) => Promise.resolve(w.terminate()).catch(() => { /* already gone */ })));
+    // Do not release generation leases or drain waiters until termination has
+    // completed: on Windows, a merely-requested termination can still own the
+    // SQLite/WAL file handles that generation GC is waiting to delete.
+    await Promise.all(ws.map(async (w) => {
+      try {
+        await w.terminate();
+      } catch {
+        // already gone
+      }
+    }));
+    for (const job of outstanding) this.finishWork(job);
+    for (const drain of this.workerDrains.values()) {
+      drain.remaining.clear();
+      drain.resolve();
+    }
+    this.workerDrains.clear();
+    for (const waiters of this.generationJobWaiters.values()) {
+      for (const resolve of waiters) resolve();
+    }
+    this.generationJobWaiters.clear();
   }
+}
+
+function generationKey(projectId: string, generationId: string): string {
+  return `${projectId}\u0000${generationId}`;
+}
+
+function generationKeyFor(project: QueryProjectDescriptor): string {
+  return generationKey(project.projectId, project.generationId);
 }

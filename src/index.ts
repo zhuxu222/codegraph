@@ -31,8 +31,13 @@ import {
   isInitialized,
   createDirectory,
   removeDirectory,
+  resolveProjectLocation,
   validateDirectory,
 } from './directory';
+import type {
+  ProjectInput,
+  ResolvedProjectLocation,
+} from './project/storage/location';
 import {
   ExtractionOrchestrator,
   IndexProgress,
@@ -51,7 +56,6 @@ import { ContextBuilder, createContextBuilder } from './context';
 import { Mutex, FileLock } from './utils';
 import { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './sync';
 import { EXTRACTION_VERSION } from './extraction/extraction-version';
-import { getCodeGraphDir } from './directory';
 import { deriveProjectNameTokens } from './search/query-utils';
 import { CodeGraphPackageVersion } from './mcp/version';
 import { segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
@@ -60,6 +64,7 @@ import { minRefsForPool } from './resolution/resolver-pool';
 
 // Re-export types for consumers
 export * from './types';
+export type { ProjectInput, ProjectLocation } from './project/storage/location';
 // Storage building blocks for embedded/SDK consumers that drive the graph
 // directly (open a DB, run prepared queries) rather than through the CodeGraph
 // facade. Exposed from the package entry so they no longer require deep imports
@@ -71,6 +76,7 @@ export {
   isInitialized,
   findNearestCodeGraphRoot,
   CODEGRAPH_DIR,
+  CODEGRAPH_LOCATION_MARKER,
 } from './directory';
 export { IndexProgress, IndexResult, SyncResult } from './extraction';
 export { detectLanguage, isLanguageSupported, isGrammarLoaded, getSupportedLanguages, initGrammars, loadGrammarsForLanguages, loadAllGrammars } from './extraction';
@@ -90,8 +96,35 @@ export {
   defaultLogger,
 } from './errors';
 export { Mutex, FileLock, processInBatches, debounce, throttle, MemoryMonitor } from './utils';
+export type { FileLockOptions } from './utils';
 export { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './sync';
-export { MCPServer } from './mcp';
+export {
+  MCPServer,
+  MCPEngine,
+  MCPSession,
+  QueryPool,
+  SocketTransport,
+  StdioTransport,
+  ToolHandler,
+  tools as mcpTools,
+  resolvePoolSize,
+} from './mcp';
+export type {
+  JsonRpcTransport,
+  MCPProjectProvider,
+  MCPEngineOptions,
+  PoolWorker,
+  ProjectFreshness,
+  ProjectHandle,
+  ProjectRuntimeState,
+  QueryCatalogSnapshot,
+  QueryGenerationLease,
+  QueryPoolOptions,
+  QueryProjectDescriptor,
+  ToolAnnotations,
+  ToolDefinition,
+  ToolResult,
+} from './mcp';
 
 /**
  * Options for initializing a new CodeGraph project
@@ -140,6 +173,7 @@ export class CodeGraph {
   private db: DatabaseConnection;
   private queries: QueryBuilder;
   private projectRoot: string;
+  private dataDir: string;
   // Assigned via wireLayers() from the constructor (and again on reopen) — the
   // `!` tells TS these are definitely set even though the assignment is one
   // method call away from the constructor body.
@@ -161,13 +195,14 @@ export class CodeGraph {
   private constructor(
     db: DatabaseConnection,
     queries: QueryBuilder,
-    projectRoot: string
+    location: ResolvedProjectLocation
   ) {
     this.db = db;
     this.queries = queries;
-    this.projectRoot = projectRoot;
+    this.projectRoot = location.projectRoot;
+    this.dataDir = location.dataDir;
     this.fileLock = new FileLock(
-      path.join(getCodeGraphDir(projectRoot), 'codegraph.lock')
+      path.join(this.dataDir, 'codegraph.lock')
     );
     this.wireLayers();
   }
@@ -241,24 +276,24 @@ export class CodeGraph {
    * @param options - Initialization options
    * @returns A new CodeGraph instance
    */
-  static async init(projectRoot: string, options: InitOptions = {}): Promise<CodeGraph> {
+  static async init(project: ProjectInput, options: InitOptions = {}): Promise<CodeGraph> {
     await initGrammars();
-    const resolvedRoot = path.resolve(projectRoot);
+    const location = resolveProjectLocation(project);
 
     // Check if already initialized
-    if (isInitialized(resolvedRoot)) {
-      throw new Error(`CodeGraph already initialized in ${resolvedRoot}`);
+    if (isInitialized(location)) {
+      throw new Error(`CodeGraph already initialized in ${location.projectRoot}`);
     }
 
     // Create directory structure
-    createDirectory(resolvedRoot);
+    createDirectory(location);
 
     // Initialize database
-    const dbPath = getDatabasePath(resolvedRoot);
+    const dbPath = getDatabasePath(location);
     const db = DatabaseConnection.initialize(dbPath);
     const queries = new QueryBuilder(db.getDb());
 
-    const instance = new CodeGraph(db, queries, resolvedRoot);
+    const instance = new CodeGraph(db, queries, location);
 
     // Run initial indexing if requested
     if (options.index) {
@@ -271,23 +306,23 @@ export class CodeGraph {
   /**
    * Initialize synchronously (without indexing)
    */
-  static initSync(projectRoot: string): CodeGraph {
-    const resolvedRoot = path.resolve(projectRoot);
+  static initSync(project: ProjectInput): CodeGraph {
+    const location = resolveProjectLocation(project);
 
     // Check if already initialized
-    if (isInitialized(resolvedRoot)) {
-      throw new Error(`CodeGraph already initialized in ${resolvedRoot}`);
+    if (isInitialized(location)) {
+      throw new Error(`CodeGraph already initialized in ${location.projectRoot}`);
     }
 
     // Create directory structure
-    createDirectory(resolvedRoot);
+    createDirectory(location);
 
     // Initialize database
-    const dbPath = getDatabasePath(resolvedRoot);
+    const dbPath = getDatabasePath(location);
     const db = DatabaseConnection.initialize(dbPath);
     const queries = new QueryBuilder(db.getDb());
 
-    return new CodeGraph(db, queries, resolvedRoot);
+    return new CodeGraph(db, queries, location);
   }
 
   /**
@@ -297,27 +332,27 @@ export class CodeGraph {
    * @param options - Open options
    * @returns A CodeGraph instance
    */
-  static async open(projectRoot: string, options: OpenOptions = {}): Promise<CodeGraph> {
+  static async open(project: ProjectInput, options: OpenOptions = {}): Promise<CodeGraph> {
     await initGrammars();
-    const resolvedRoot = path.resolve(projectRoot);
+    const location = resolveProjectLocation(project);
 
     // Check if initialized
-    if (!isInitialized(resolvedRoot)) {
-      throw new Error(`CodeGraph not initialized in ${resolvedRoot}. Run init() first.`);
+    if (!isInitialized(location)) {
+      throw new Error(`CodeGraph not initialized in ${location.projectRoot}. Run init() first.`);
     }
 
     // Validate directory structure
-    const validation = validateDirectory(resolvedRoot);
+    const validation = validateDirectory(location);
     if (!validation.valid) {
       throw new Error(`Invalid CodeGraph directory: ${validation.errors.join(', ')}`);
     }
 
     // Open database
-    const dbPath = getDatabasePath(resolvedRoot);
+    const dbPath = getDatabasePath(location);
     const db = DatabaseConnection.open(dbPath);
     const queries = new QueryBuilder(db.getDb());
 
-    const instance = new CodeGraph(db, queries, resolvedRoot);
+    const instance = new CodeGraph(db, queries, location);
 
     // Sync if requested
     if (options.sync) {
@@ -343,17 +378,17 @@ export class CodeGraph {
    * files is O(1) regardless of size, reclaims the disk, and sidesteps opening
    * (and running migrations against) the poisoned database entirely.
    */
-  static async recreate(projectRoot: string): Promise<CodeGraph> {
+  static async recreate(project: ProjectInput): Promise<CodeGraph> {
     await initGrammars();
-    const resolvedRoot = path.resolve(projectRoot);
+    const location = resolveProjectLocation(project);
 
     // Check if initialized — recreate REBUILDS an existing project; it is not a
     // first-time `init`.
-    if (!isInitialized(resolvedRoot)) {
-      throw new Error(`CodeGraph not initialized in ${resolvedRoot}. Run init() first.`);
+    if (!isInitialized(location)) {
+      throw new Error(`CodeGraph not initialized in ${location.projectRoot}. Run init() first.`);
     }
 
-    const dbPath = getDatabasePath(resolvedRoot);
+    const dbPath = getDatabasePath(location);
     try {
       removeDatabaseFiles(dbPath);
     } catch (err) {
@@ -364,7 +399,7 @@ export class CodeGraph {
       throw new Error(
         `Could not rebuild the index — the database file is in use (${reason}). ` +
           `Stop any running CodeGraph MCP server/daemon for this project and retry, ` +
-          `or remove the ${getCodeGraphDir(resolvedRoot)} directory and run "codegraph init".`
+          `or remove the ${location.dataDir} directory and run "codegraph init".`
       );
     }
 
@@ -372,39 +407,39 @@ export class CodeGraph {
     const db = DatabaseConnection.initialize(dbPath);
     const queries = new QueryBuilder(db.getDb());
 
-    return new CodeGraph(db, queries, resolvedRoot);
+    return new CodeGraph(db, queries, location);
   }
 
   /**
    * Open synchronously (without sync)
    */
-  static openSync(projectRoot: string): CodeGraph {
-    const resolvedRoot = path.resolve(projectRoot);
+  static openSync(project: ProjectInput): CodeGraph {
+    const location = resolveProjectLocation(project);
 
     // Check if initialized
-    if (!isInitialized(resolvedRoot)) {
-      throw new Error(`CodeGraph not initialized in ${resolvedRoot}. Run init() first.`);
+    if (!isInitialized(location)) {
+      throw new Error(`CodeGraph not initialized in ${location.projectRoot}. Run init() first.`);
     }
 
     // Validate directory structure
-    const validation = validateDirectory(resolvedRoot);
+    const validation = validateDirectory(location);
     if (!validation.valid) {
       throw new Error(`Invalid CodeGraph directory: ${validation.errors.join(', ')}`);
     }
 
     // Open database
-    const dbPath = getDatabasePath(resolvedRoot);
+    const dbPath = getDatabasePath(location);
     const db = DatabaseConnection.open(dbPath);
     const queries = new QueryBuilder(db.getDb());
 
-    return new CodeGraph(db, queries, resolvedRoot);
+    return new CodeGraph(db, queries, location);
   }
 
   /**
    * Check if a directory has been initialized as a CodeGraph project
    */
-  static isInitialized(projectRoot: string): boolean {
-    return isInitialized(path.resolve(projectRoot));
+  static isInitialized(project: ProjectInput): boolean {
+    return isInitialized(resolveProjectLocation(project));
   }
 
   /**
@@ -422,6 +457,13 @@ export class CodeGraph {
    */
   getProjectRoot(): string {
     return this.projectRoot;
+  }
+
+  /**
+   * Get the directory that owns this instance's generated CodeGraph data.
+   */
+  getDataDir(): string {
+    return this.dataDir;
   }
 
   // ===========================================================================
@@ -1822,7 +1864,7 @@ export class CodeGraph {
    */
   uninitialize(): void {
     this.close();
-    removeDirectory(this.projectRoot);
+    removeDirectory({ projectRoot: this.projectRoot, dataDir: this.dataDir });
   }
 }
 

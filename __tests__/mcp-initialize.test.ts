@@ -99,6 +99,17 @@ function waitFor<T>(
   });
 }
 
+async function stopServer(
+  child: ChildProcessWithoutNullStreams,
+): Promise<void> {
+  if (child.exitCode !== null) return;
+  const exited = new Promise<void>((resolve) => {
+    child.once('exit', () => resolve());
+  });
+  child.kill('SIGKILL');
+  await exited;
+}
+
 describe('MCP initialize handshake (issue #172)', () => {
   let tempDir: string;
   let child: ChildProcessWithoutNullStreams | null = null;
@@ -107,10 +118,11 @@ describe('MCP initialize handshake (issue #172)', () => {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-mcp-init-'));
   });
 
-  afterEach(() => {
-    if (child && !child.killed) {
-      child.kill('SIGKILL');
+  afterEach(async () => {
+    if (child) {
+      const running = child;
       child = null;
+      await stopServer(running);
     }
     fs.rmSync(tempDir, { recursive: true, force: true });
   });

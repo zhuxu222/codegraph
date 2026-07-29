@@ -16,6 +16,7 @@ import { findNearestCodeGraphRoot } from '../directory';
 import { watchDisabledReason } from '../sync';
 import { ToolHandler } from './tools';
 import { QueryPool, resolvePoolSize } from './query-pool';
+import type { MCPProjectProvider } from './project-provider';
 
 // Lazy-load the heavy CodeGraph chain (sqlite + query/graph/context layers) OFF
 // the MCP startup path. It's only needed once a tool actually opens a project —
@@ -42,6 +43,14 @@ export interface MCPEngineOptions {
    * disables it even in daemon mode.
    */
   queryPool?: boolean;
+  /** Workspace-owned project routing and lifecycle. Omit for legacy discovery. */
+  projectProvider?: MCPProjectProvider;
+}
+
+interface ResolvedMCPEngineOptions {
+  watch: boolean;
+  queryPool: boolean;
+  projectProvider: MCPProjectProvider | null;
 }
 
 /**
@@ -60,15 +69,19 @@ export class MCPEngine {
   // Set on first `ensureInitialized` so subsequent sessions don't redo work.
   private initPromise: Promise<void> | null = null;
   private watcherStarted = false;
-  private opts: Required<MCPEngineOptions>;
+  private opts: ResolvedMCPEngineOptions;
   private closed = false;
   // Off-loop read-tool pool (daemon mode only). Created lazily once the default
   // project is open — workers each hold their own WAL read connection.
   private queryPool: QueryPool | null = null;
 
   constructor(opts: MCPEngineOptions = {}) {
-    this.opts = { watch: opts.watch ?? true, queryPool: opts.queryPool ?? false };
-    this.toolHandler = new ToolHandler(null);
+    this.opts = {
+      watch: opts.watch ?? true,
+      queryPool: opts.queryPool ?? false,
+      projectProvider: opts.projectProvider ?? null,
+    };
+    this.toolHandler = new ToolHandler(null, this.opts.projectProvider);
   }
 
   /**
@@ -111,6 +124,11 @@ export class MCPEngine {
     return this.projectPath;
   }
 
+  /** Whether project routing is supplied by an external multi-project provider. */
+  usesProjectProvider(): boolean {
+    return this.opts.projectProvider !== null;
+  }
+
   /** Shared ToolHandler — sessions delegate tool dispatch through this. */
   getToolHandler(): ToolHandler {
     return this.toolHandler;
@@ -132,6 +150,10 @@ export class MCPEngine {
    */
   async ensureInitialized(searchFrom: string): Promise<void> {
     if (this.closed) return;
+    if (this.opts.projectProvider) {
+      this.setProjectPathHint(searchFrom);
+      return;
+    }
     if (this.toolHandler.hasDefaultCodeGraph()) return;
     if (this.initPromise) {
       try { await this.initPromise; } catch { /* let caller retry */ }
@@ -156,6 +178,10 @@ export class MCPEngine {
    */
   retryInitializeSync(searchFrom: string): void {
     if (this.closed) return;
+    if (this.opts.projectProvider) {
+      this.setProjectPathHint(searchFrom);
+      return;
+    }
     if (this.toolHandler.hasDefaultCodeGraph()) return;
     this.toolHandler.setDefaultProjectHint(searchFrom);
     const resolvedRoot = findNearestCodeGraphRoot(searchFrom);

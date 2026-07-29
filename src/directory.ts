@@ -7,6 +7,16 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import type {
+  ProjectInput,
+  ResolvedProjectLocation,
+} from './project/storage/location';
+
+export type {
+  ProjectInput,
+  ProjectLocation,
+  ResolvedProjectLocation,
+} from './project/storage/location';
 
 /** The default per-project data directory name. */
 const DEFAULT_CODEGRAPH_DIR = '.codegraph';
@@ -64,6 +74,15 @@ export function codeGraphDirName(): string {
  */
 export const CODEGRAPH_DIR = codeGraphDirName();
 
+/** Ownership marker used to validate destructive operations on external data. */
+export const CODEGRAPH_LOCATION_MARKER = '.codegraph-location.json';
+
+interface CodeGraphLocationMarker {
+  schemaVersion: 1;
+  projectRoot: string;
+  dataDir: string;
+}
+
 /**
  * Is `name` (a single path segment) a CodeGraph data directory? Matches the
  * default `.codegraph`, the active `CODEGRAPH_DIR` override, and any
@@ -80,18 +99,73 @@ export function isCodeGraphDataDir(name: string): boolean {
 }
 
 /**
- * Get the .codegraph directory path for a project
+ * Get the CodeGraph data directory path for a project.
+ *
+ * String inputs preserve the legacy path behavior exactly, including the live
+ * `CODEGRAPH_DIR` override. A location with an explicit `dataDir` bypasses that
+ * override and resolves the external storage path to an absolute path.
  */
-export function getCodeGraphDir(projectRoot: string): string {
+export function getCodeGraphDir(input: ProjectInput): string {
+  if (typeof input !== 'string' && input.dataDir !== undefined) {
+    if (input.dataDir.trim() === '') {
+      throw new Error('CodeGraph dataDir must not be empty');
+    }
+    return path.resolve(input.dataDir);
+  }
+  const projectRoot = typeof input === 'string' ? input : input.projectRoot;
   return path.join(projectRoot, codeGraphDirName());
+}
+
+/**
+ * Resolve a public project input once at the lifecycle boundary.
+ *
+ * Keeping the resolved data directory on the instance is important: changing
+ * `CODEGRAPH_DIR` later must not redirect locks, database access, or
+ * `uninitialize()` to a different directory.
+ */
+export function resolveProjectLocation(input: ProjectInput): ResolvedProjectLocation {
+  const rawProjectRoot = typeof input === 'string' ? input : input.projectRoot;
+  if (rawProjectRoot.trim() === '') {
+    throw new Error('CodeGraph projectRoot must not be empty');
+  }
+
+  const projectRoot = path.resolve(rawProjectRoot);
+  const dataDir = path.resolve(
+    getCodeGraphDir(
+      typeof input === 'string'
+        ? projectRoot
+        : { projectRoot, dataDir: input.dataDir }
+    )
+  );
+
+  if (typeof input !== 'string' && input.dataDir !== undefined) {
+    const sourceRelativeToData = path.relative(dataDir, projectRoot);
+    const dataContainsSource =
+      sourceRelativeToData === '' ||
+      (
+        sourceRelativeToData !== '..' &&
+        !sourceRelativeToData.startsWith(`..${path.sep}`) &&
+        !path.isAbsolute(sourceRelativeToData)
+      );
+    if (dataContainsSource) {
+      throw new Error(
+        'CodeGraph dataDir must not be the projectRoot or one of its parent directories'
+      );
+    }
+    if (!isEmbeddedDataLocation(projectRoot, dataDir)) {
+      assertNoLinkedPathComponents(dataDir);
+    }
+  }
+
+  return { projectRoot, dataDir };
 }
 
 /**
  * Check if a project has been initialized with CodeGraph
  * Requires both .codegraph/ directory AND codegraph.db to exist
  */
-export function isInitialized(projectRoot: string): boolean {
-  const codegraphDir = getCodeGraphDir(projectRoot);
+export function isInitialized(project: ProjectInput): boolean {
+  const codegraphDir = getCodeGraphDir(project);
   if (!fs.existsSync(codegraphDir) || !fs.statSync(codegraphDir).isDirectory()) {
     return false;
   }
@@ -641,9 +715,12 @@ function ensureGitignore(gitignorePath: string): boolean {
  * Create the .codegraph directory structure
  * Note: Only throws if codegraph.db already exists, not just if .codegraph/ exists.
  */
-export function createDirectory(projectRoot: string): void {
-  const codegraphDir = getCodeGraphDir(projectRoot);
+export function createDirectory(project: ProjectInput): void {
+  const location = resolveProjectLocation(project);
+  const codegraphDir = location.dataDir;
+  const projectRoot = location.projectRoot;
   const dbPath = path.join(codegraphDir, 'codegraph.db');
+  const external = !isEmbeddedDataLocation(projectRoot, codegraphDir);
 
   // Only throw if CodeGraph is actually initialized (db exists)
   // .codegraph/ folder alone is fine
@@ -651,22 +728,52 @@ export function createDirectory(projectRoot: string): void {
     throw new Error(`CodeGraph already initialized in ${projectRoot}`);
   }
 
+  if (external && fs.existsSync(codegraphDir)) {
+    const existing = fs.lstatSync(codegraphDir);
+    if (!existing.isDirectory() || existing.isSymbolicLink()) {
+      throw new Error(
+        `CodeGraph external dataDir must be a real directory: ${codegraphDir}`
+      );
+    }
+    const markerPath = path.join(codegraphDir, CODEGRAPH_LOCATION_MARKER);
+    const entries = fs.readdirSync(codegraphDir);
+    if (!fs.existsSync(markerPath) && entries.length > 0) {
+      throw new Error(
+        `Refusing to claim non-empty unmarked external CodeGraph data: ${codegraphDir}`
+      );
+    }
+  }
+
   // Create main directory (if it doesn't exist)
   fs.mkdirSync(codegraphDir, { recursive: true });
+  if (external) {
+    assertNoLinkedPathComponents(codegraphDir);
+  }
 
   // Write .gitignore inside .codegraph (create if absent, upgrade a stale
   // pre-wildcard default left by an older version — issue #788).
   ensureGitignore(path.join(codegraphDir, '.gitignore'));
+  ensureLocationMarker(location);
 }
 
 /**
  * Remove the .codegraph directory
  */
-export function removeDirectory(projectRoot: string): void {
-  const codegraphDir = getCodeGraphDir(projectRoot);
+export function removeDirectory(project: ProjectInput): void {
+  const location = resolveProjectLocation(project);
+  const codegraphDir = location.dataDir;
 
   if (!fs.existsSync(codegraphDir)) {
     return;
+  }
+
+  // Parent links/junctions can redirect a lexically safe path elsewhere.
+  const external = !isEmbeddedDataLocation(
+    location.projectRoot,
+    location.dataDir,
+  );
+  if (external) {
+    assertNoLinkedPathComponents(path.dirname(codegraphDir));
   }
 
   // Verify .codegraph is a real directory, not a symlink pointing elsewhere
@@ -678,20 +785,155 @@ export function removeDirectory(projectRoot: string): void {
   }
 
   if (!lstat.isDirectory()) {
-    // Not a directory - remove the single file
+    if (external) {
+      throw new Error(
+        `Refusing to remove a non-directory external CodeGraph path: ${codegraphDir}`
+      );
+    }
+    // Preserve legacy embedded cleanup behavior for a path occupied by a file.
     fs.unlinkSync(codegraphDir);
     return;
+  }
+
+  assertLocationMarkerOrLegacyEmbedded(location);
+  if (external) {
+    const canonicalDataDir = fs.realpathSync.native(codegraphDir);
+    if (!samePath(canonicalDataDir, codegraphDir)) {
+      throw new Error(
+        `Refusing to remove CodeGraph data through a redirected path: ${codegraphDir}`
+      );
+    }
   }
 
   // Recursively remove directory
   fs.rmSync(codegraphDir, { recursive: true, force: true });
 }
 
+function ensureLocationMarker(location: ResolvedProjectLocation): void {
+  const markerPath = path.join(location.dataDir, CODEGRAPH_LOCATION_MARKER);
+  const expected: CodeGraphLocationMarker = {
+    schemaVersion: 1,
+    projectRoot: path.resolve(location.projectRoot),
+    dataDir: path.resolve(location.dataDir),
+  };
+  if (fs.existsSync(markerPath)) {
+    const existing = readLocationMarker(markerPath);
+    if (
+      !samePath(existing.projectRoot, expected.projectRoot) ||
+      !samePath(existing.dataDir, expected.dataDir)
+    ) {
+      throw new Error(
+        `CodeGraph data directory ownership marker does not match ${location.dataDir}`
+      );
+    }
+    return;
+  }
+  fs.writeFileSync(
+    markerPath,
+    `${JSON.stringify(expected, null, 2)}\n`,
+    { encoding: 'utf8', flag: 'wx', mode: 0o600 }
+  );
+}
+
+function assertLocationMarkerOrLegacyEmbedded(
+  location: ResolvedProjectLocation
+): void {
+  const markerPath = path.join(location.dataDir, CODEGRAPH_LOCATION_MARKER);
+  if (fs.existsSync(markerPath)) {
+    const marker = readLocationMarker(markerPath);
+    if (
+      !samePath(marker.projectRoot, location.projectRoot) ||
+      !samePath(marker.dataDir, location.dataDir)
+    ) {
+      throw new Error(
+        `Refusing to remove CodeGraph data with a mismatched ownership marker: ${location.dataDir}`
+      );
+    }
+    return;
+  }
+
+  // Backward compatibility for pre-marker embedded indexes only. External
+  // directories must carry an exact ownership marker.
+  if (
+    !isEmbeddedDataLocation(location.projectRoot, location.dataDir)
+  ) {
+    throw new Error(
+      `Refusing to remove unmarked external CodeGraph data: ${location.dataDir}`
+    );
+  }
+}
+
+function readLocationMarker(markerPath: string): CodeGraphLocationMarker {
+  const markerStat = fs.lstatSync(markerPath);
+  if (!markerStat.isFile() || markerStat.isSymbolicLink()) {
+    throw new Error(
+      `Invalid CodeGraph data directory ownership marker: ${markerPath}`
+    );
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
+  } catch (error) {
+    throw new Error(
+      `Invalid CodeGraph data directory ownership marker: ${markerPath}`,
+      { cause: error }
+    );
+  }
+  if (
+    typeof value !== 'object' ||
+    value === null ||
+    (value as Partial<CodeGraphLocationMarker>).schemaVersion !== 1 ||
+    typeof (value as Partial<CodeGraphLocationMarker>).projectRoot !== 'string' ||
+    typeof (value as Partial<CodeGraphLocationMarker>).dataDir !== 'string'
+  ) {
+    throw new Error(
+      `Invalid CodeGraph data directory ownership marker: ${markerPath}`
+    );
+  }
+  return value as CodeGraphLocationMarker;
+}
+
+/**
+ * Reject every existing symbolic-link/reparse component. Node reports Windows
+ * directory junctions as symbolic links through lstat().
+ */
+function assertNoLinkedPathComponents(candidateInput: string): void {
+  const candidate = path.resolve(candidateInput);
+  const parsed = path.parse(candidate);
+  const relative = candidate.slice(parsed.root.length);
+  const segments = relative.split(path.sep).filter(Boolean);
+  let current = parsed.root;
+  for (const segment of segments) {
+    current = path.join(current, segment);
+    if (!fs.existsSync(current)) continue;
+    if (fs.lstatSync(current).isSymbolicLink()) {
+      throw new Error(
+        `CodeGraph data path must not contain a symlink or junction: ${current}`
+      );
+    }
+  }
+}
+
+function samePath(leftInput: string, rightInput: string): boolean {
+  const left = path.resolve(leftInput);
+  const right = path.resolve(rightInput);
+  return process.platform === 'win32'
+    ? left.toLocaleLowerCase('en-US') === right.toLocaleLowerCase('en-US')
+    : left === right;
+}
+
+function isEmbeddedDataLocation(projectRoot: string, dataDir: string): boolean {
+  return (
+    samePath(path.dirname(dataDir), projectRoot) &&
+    isCodeGraphDataDir(path.basename(dataDir))
+  );
+}
+
 /**
  * Get all files in the .codegraph directory
  */
-export function listDirectoryContents(projectRoot: string): string[] {
-  const codegraphDir = getCodeGraphDir(projectRoot);
+export function listDirectoryContents(project: ProjectInput): string[] {
+  const codegraphDir = getCodeGraphDir(project);
 
   if (!fs.existsSync(codegraphDir)) {
     return [];
@@ -725,8 +967,8 @@ export function listDirectoryContents(projectRoot: string): string[] {
 /**
  * Get the total size of the .codegraph directory in bytes
  */
-export function getDirectorySize(projectRoot: string): number {
-  const codegraphDir = getCodeGraphDir(projectRoot);
+export function getDirectorySize(project: ProjectInput): number {
+  const codegraphDir = getCodeGraphDir(project);
 
   if (!fs.existsSync(codegraphDir)) {
     return 0;
@@ -761,12 +1003,12 @@ export function getDirectorySize(projectRoot: string): number {
 /**
  * Ensure a subdirectory exists within .codegraph
  */
-export function ensureSubdirectory(projectRoot: string, subdirName: string): string {
+export function ensureSubdirectory(project: ProjectInput, subdirName: string): string {
   if (subdirName.includes('..') || subdirName.includes(path.sep) || subdirName.includes('/')) {
     throw new Error(`Invalid subdirectory name: ${subdirName}`);
   }
 
-  const subdirPath = path.join(getCodeGraphDir(projectRoot), subdirName);
+  const subdirPath = path.join(getCodeGraphDir(project), subdirName);
 
   if (!fs.existsSync(subdirPath)) {
     fs.mkdirSync(subdirPath, { recursive: true });
@@ -778,12 +1020,12 @@ export function ensureSubdirectory(projectRoot: string, subdirName: string): str
 /**
  * Check if the .codegraph directory has valid structure
  */
-export function validateDirectory(projectRoot: string): {
+export function validateDirectory(project: ProjectInput): {
   valid: boolean;
   errors: string[];
 } {
   const errors: string[] = [];
-  const codegraphDir = getCodeGraphDir(projectRoot);
+  const codegraphDir = getCodeGraphDir(project);
 
   if (!fs.existsSync(codegraphDir)) {
     errors.push('CodeGraph directory does not exist');

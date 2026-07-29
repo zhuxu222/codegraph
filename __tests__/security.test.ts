@@ -12,7 +12,12 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { FileLock, validateProjectPath, validatePathWithinRoot } from '../src/utils';
+import {
+  FileLock,
+  fileLockHostId,
+  validateProjectPath,
+  validatePathWithinRoot,
+} from '../src/utils';
 import CodeGraph from '../src/index';
 import { ToolHandler, tools } from '../src/mcp/tools';
 import { scanDirectory, isSourceFile } from '../src/extraction';
@@ -47,8 +52,17 @@ describe('FileLock', () => {
     lock.acquire();
 
     expect(fs.existsSync(lockPath)).toBe(true);
-    const content = fs.readFileSync(lockPath, 'utf-8').trim();
-    expect(parseInt(content, 10)).toBe(process.pid);
+    const lease = JSON.parse(fs.readFileSync(lockPath, 'utf-8'));
+    expect(lease).toMatchObject({
+      pid: process.pid,
+      hostId: fileLockHostId(),
+    });
+    expect(lease.nonce).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+    );
+    expect(lease.acquiredAt).toEqual(expect.any(Number));
+    expect(lease.heartbeatAt).toBe(lease.acquiredAt);
+    expect(lease.processStartToken).toEqual(expect.any(String));
 
     lock.release();
     expect(fs.existsSync(lockPath)).toBe(false);
@@ -76,6 +90,136 @@ describe('FileLock', () => {
     expect(() => lock.acquire()).not.toThrow();
 
     lock.release();
+  });
+
+  it('should recover a structured lease whose local owner crashed', () => {
+    const now = Date.now();
+    fs.writeFileSync(lockPath, JSON.stringify({
+      nonce: 'crashed-owner',
+      pid: 99999999,
+      hostId: fileLockHostId(),
+      acquiredAt: now,
+      heartbeatAt: now,
+    }));
+
+    const lock = new FileLock(lockPath);
+    expect(() => lock.acquire()).not.toThrow();
+    expect(JSON.parse(fs.readFileSync(lockPath, 'utf8')).nonce).not.toBe('crashed-owner');
+    lock.release();
+  });
+
+  it('should recover an expired lease from another host', () => {
+    const old = Date.now() - 10_000;
+    fs.writeFileSync(lockPath, JSON.stringify({
+      nonce: 'remote-owner',
+      pid: process.pid,
+      hostId: 'another-host.invalid',
+      acquiredAt: old,
+      heartbeatAt: old,
+    }));
+    fs.utimesSync(lockPath, new Date(old), new Date(old));
+
+    const lock = new FileLock(lockPath, { staleTimeoutMs: 25 });
+    expect(() => lock.acquire()).not.toThrow();
+    expect(JSON.parse(fs.readFileSync(lockPath, 'utf8')).nonce).not.toBe('remote-owner');
+    lock.release();
+  });
+
+  it('should recover through the guarded fallback when hard links are unavailable', () => {
+    const old = Date.now() - 10_000;
+    fs.writeFileSync(lockPath, JSON.stringify({
+      nonce: 'remote-owner',
+      pid: process.pid,
+      hostId: 'another-host.invalid',
+      acquiredAt: old,
+      heartbeatAt: old,
+    }));
+    fs.utimesSync(lockPath, new Date(old), new Date(old));
+
+    const lock = new FileLock(lockPath, { staleTimeoutMs: 25 }) as any;
+    const observed = lock.readSnapshot(lockPath);
+    expect(lock.reclaimWithGuard(observed)).toBe(true);
+    expect(fs.existsSync(lockPath)).toBe(false);
+  });
+
+  it('should not steal a live local lease solely because it is old', () => {
+    const owner = new FileLock(lockPath, { heartbeatIntervalMs: 60_000 });
+    owner.acquire();
+
+    const lease = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+    const old = Date.now() - 10_000;
+    lease.heartbeatAt = old;
+    fs.writeFileSync(lockPath, JSON.stringify(lease));
+    fs.utimesSync(lockPath, new Date(old), new Date(old));
+
+    const contender = new FileLock(lockPath, { staleTimeoutMs: 25 });
+    expect(() => contender.acquire()).toThrow(/locked by another process/);
+    expect(JSON.parse(fs.readFileSync(lockPath, 'utf8')).nonce).toBe(lease.nonce);
+
+    owner.release();
+  });
+
+  it('should recover a local lease after PID reuse is detected', () => {
+    const owner = new FileLock(lockPath, { heartbeatIntervalMs: 60_000 });
+    owner.acquire();
+    const lease = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+    owner.release();
+    if (String(lease.processStartToken).startsWith('fallback:')) {
+      // The platform cannot expose another process's birth identity. The lock
+      // deliberately stays conservative in this mode.
+      return;
+    }
+
+    // Keep the current live PID but replace its process-birth identity. A PID
+    // liveness-only lock would wedge forever; the token proves this lease
+    // belongs to an earlier process incarnation.
+    lease.nonce = 'reused-pid-owner';
+    lease.processStartToken = `${String(lease.processStartToken)}-different`;
+    fs.writeFileSync(lockPath, JSON.stringify(lease));
+
+    const contender = new FileLock(lockPath);
+    expect(() => contender.acquire()).not.toThrow();
+    expect(JSON.parse(fs.readFileSync(lockPath, 'utf8')).nonce).not.toBe(
+      'reused-pid-owner'
+    );
+    contender.release();
+  });
+
+  it('should renew heartbeat from outside the main lock owner', async () => {
+    const lock = new FileLock(lockPath, { heartbeatIntervalMs: 15 });
+    lock.acquire();
+    const first = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+
+    const deadline = Date.now() + 1_000;
+    let renewed = first;
+    while (renewed.heartbeatAt === first.heartbeatAt && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      renewed = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+    }
+
+    expect(renewed.nonce).toBe(first.nonce);
+    expect(renewed.heartbeatAt).toBeGreaterThan(first.heartbeatAt);
+    lock.release();
+  });
+
+  it('release should not remove a lease with a different nonce', () => {
+    const lock = new FileLock(lockPath, { heartbeatIntervalMs: 60_000 });
+    lock.acquire();
+
+    const replacement = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+    replacement.nonce = 'replacement-owner';
+    fs.writeFileSync(lockPath, JSON.stringify(replacement));
+
+    lock.release();
+    expect(fs.existsSync(lockPath)).toBe(true);
+    expect(JSON.parse(fs.readFileSync(lockPath, 'utf8')).nonce).toBe('replacement-owner');
+  });
+
+  it('should conservatively reject a recent malformed lease', () => {
+    fs.writeFileSync(lockPath, '{"nonce":');
+    const lock = new FileLock(lockPath, { staleTimeoutMs: 60_000 });
+    expect(() => lock.acquire()).toThrow(/locked by another process/);
+    expect(fs.readFileSync(lockPath, 'utf8')).toBe('{"nonce":');
   });
 
   it('should execute function with withLock', () => {

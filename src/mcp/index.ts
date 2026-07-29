@@ -482,8 +482,27 @@ function sleep(ms: number): Promise<void> {
 }
 
 // Export for use in CLI
-export { StdioTransport } from './transport';
+export { SocketTransport, StdioTransport } from './transport';
 export { tools, ToolHandler } from './tools';
+export type { ToolAnnotations, ToolDefinition, ToolResult } from './tools';
+export { MCPEngine } from './engine';
+export type { MCPEngineOptions } from './engine';
+export { MCPSession } from './session';
+export { QueryPool, resolvePoolSize } from './query-pool';
+export type { JsonRpcTransport } from './transport';
+export type {
+  PoolWorker,
+  QueryCatalogSnapshot,
+  QueryGenerationLease,
+  QueryPoolOptions,
+  QueryProjectDescriptor,
+} from './query-pool';
+export type {
+  MCPProjectProvider,
+  ProjectFreshness,
+  ProjectHandle,
+  ProjectRuntimeState,
+} from './project-provider';
 // Surface a few daemon-mode bits for tests + diagnostics.
 export { Daemon } from './daemon';
 export { CodeGraphPackageVersion } from './version';

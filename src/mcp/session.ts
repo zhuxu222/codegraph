@@ -15,7 +15,6 @@
 import * as path from 'path';
 import { JsonRpcRequest, JsonRpcNotification, JsonRpcTransport, ErrorCodes } from './transport';
 import { MCPEngine } from './engine';
-import { tools } from './tools';
 import { SERVER_INSTRUCTIONS, SERVER_INSTRUCTIONS_NO_ROOT_INDEX } from './server-instructions';
 import { CodeGraphPackageVersion } from './version';
 import { findNearestCodeGraphRoot } from '../directory';
@@ -110,6 +109,12 @@ export class MCPSession {
   private rootsAttempted = false;
   private resolvePromise: Promise<void> | null = null;
   private explicitProjectPath: string | null;
+  /**
+   * Default routing hint owned by this connection. The daemon shares one
+   * MCPEngine across sessions, so an engine/provider-level default cannot be
+   * used safely: another client's initialize handshake could overwrite it.
+   */
+  private sessionProjectPath: string | null;
 
   constructor(
     private transport: JsonRpcTransport,
@@ -117,6 +122,7 @@ export class MCPSession {
     opts: MCPSessionOptions = {},
   ) {
     this.explicitProjectPath = opts.explicitProjectPath ?? null;
+    this.sessionProjectPath = this.explicitProjectPath;
   }
 
   /**
@@ -210,6 +216,7 @@ export class MCPSession {
     } else if (this.explicitProjectPath) {
       explicitPath = this.explicitProjectPath;
     }
+    if (explicitPath) this.sessionProjectPath = explicitPath;
 
     // Pick the instructions variant by the root's index state — a cheap
     // synchronous walk-up (existsSync loop only, no DB open, so the #172
@@ -270,10 +277,9 @@ export class MCPSession {
     }
 
     const toolName = params.name;
-    const toolArgs = params.arguments || {};
+    const suppliedArgs = params.arguments || {};
 
-    const tool = tools.find((t) => t.name === toolName);
-    if (!tool) {
+    if (!this.engine.getToolHandler().supportsTool(toolName)) {
       this.transport.sendError(
         request.id,
         ErrorCodes.InvalidParams,
@@ -284,6 +290,10 @@ export class MCPSession {
 
     if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] toolsCall ${toolName} id=${String(request.id)} pre-init\n`);
     await this.retryInitIfNeeded();
+    const toolArgs =
+      suppliedArgs.projectPath === undefined && this.sessionProjectPath
+        ? { ...suppliedArgs, projectPath: this.sessionProjectPath }
+        : suppliedArgs;
 
     if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] toolsCall ${toolName} id=${String(request.id)} dispatch\n`);
     const result = await this.engine.getToolHandler().execute(toolName, toolArgs);
@@ -308,14 +318,31 @@ export class MCPSession {
       this.resolvePromise = null;
     }
 
-    if (this.engine.hasDefaultCodeGraph()) return;
+    // A resolved root belongs to this session even when the engine/provider is
+    // shared. Never borrow another session's engine-level default.
+    if (this.sessionProjectPath) {
+      if (this.engine.hasDefaultCodeGraph()) return;
+      this.engine.retryInitializeSync(this.sessionProjectPath);
+      return;
+    }
 
-    const hint = this.explicitProjectPath ?? this.engine.getProjectPath();
-    if (!hint && !this.rootsAttempted) {
+    if (!this.rootsAttempted) {
       this.rootsAttempted = true;
-      this.resolvePromise = this.clientSupportsRoots
-        ? this.initFromRoots()
-        : this.engine.ensureInitialized(process.cwd());
+      if (this.clientSupportsRoots) {
+        this.resolvePromise = this.initFromRoots();
+      } else {
+        // cwd is process-stable. engine.getProjectPath() may have been set by
+        // another client and therefore must not be treated as this session's
+        // route.
+        const target = this.explicitProjectPath ?? process.cwd();
+        // Preserve the legacy no-root response shape. Workspace providers need
+        // cwd injected so an unregistered workspace root cannot fall back to a
+        // different registered repository.
+        if (this.engine.usesProjectProvider()) {
+          this.sessionProjectPath = target;
+        }
+        this.resolvePromise = this.engine.ensureInitialized(target);
+      }
       try { await this.resolvePromise; } catch { /* fall through */ }
       this.resolvePromise = null;
       if (this.engine.hasDefaultCodeGraph()) return;
@@ -323,7 +350,13 @@ export class MCPSession {
 
     // Last resort: walk from the best candidate (sync open). Picks up
     // projects that appeared after the server started.
-    const candidate = hint ?? process.cwd();
+    const candidate =
+      this.sessionProjectPath ??
+      this.explicitProjectPath ??
+      process.cwd();
+    if (!this.sessionProjectPath && this.engine.usesProjectProvider()) {
+      this.sessionProjectPath = candidate;
+    }
     this.engine.retryInitializeSync(candidate);
   }
 
@@ -345,6 +378,7 @@ export class MCPSession {
       const msg = err instanceof Error ? err.message : String(err);
       process.stderr.write(`[CodeGraph MCP] roots/list request failed (${msg}); falling back to process cwd.\n`);
     }
+    this.sessionProjectPath = target;
     await this.engine.ensureInitialized(target);
   }
 }

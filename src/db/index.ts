@@ -10,6 +10,7 @@ import * as path from 'path';
 import { SchemaVersion } from '../types';
 import { runMigrations, getCurrentVersion, CURRENT_SCHEMA_VERSION } from './migrations';
 import { getCodeGraphDir } from '../directory';
+import type { ProjectInput } from '../project/storage/location';
 
 export { SqliteDatabase, SqliteBackend } from './sqlite-adapter';
 
@@ -717,8 +718,8 @@ const WAL_SIDECAR_SUFFIXES = ['-wal', '-shm'] as const;
 /**
  * Get the default database path for a project
  */
-export function getDatabasePath(projectRoot: string): string {
-  return path.join(getCodeGraphDir(projectRoot), DATABASE_FILENAME);
+export function getDatabasePath(project: ProjectInput): string {
+  return path.join(getCodeGraphDir(project), DATABASE_FILENAME);
 }
 
 /**

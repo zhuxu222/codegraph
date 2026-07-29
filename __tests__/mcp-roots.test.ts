@@ -74,6 +74,17 @@ function send(child: ChildProcessWithoutNullStreams, msg: object): void {
 
 const CLIENT_INFO = { name: 'test', version: '0.0.0' };
 
+async function stopServer(
+  child: ChildProcessWithoutNullStreams,
+): Promise<void> {
+  if (child.exitCode !== null) return;
+  const exited = new Promise<void>((resolve) => {
+    child.once('exit', () => resolve());
+  });
+  child.kill('SIGKILL');
+  await exited;
+}
+
 describe('MCP project resolution via roots/list (issue #196)', () => {
   let cwdDir: string;     // where the server is launched — has NO .codegraph
   let projectDir: string; // the real indexed project the client reports
@@ -84,10 +95,11 @@ describe('MCP project resolution via roots/list (issue #196)', () => {
     projectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-mcp-proj-'));
   });
 
-  afterEach(() => {
-    if (child && !child.killed) {
-      child.kill('SIGKILL');
+  afterEach(async () => {
+    if (child) {
+      const running = child;
       child = null;
+      await stopServer(running);
     }
     fs.rmSync(cwdDir, { recursive: true, force: true });
     fs.rmSync(projectDir, { recursive: true, force: true });
