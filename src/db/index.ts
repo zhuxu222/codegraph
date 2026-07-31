@@ -4,7 +4,12 @@
  * Handles SQLite database initialization and connection management.
  */
 
-import { SqliteDatabase, SqliteBackend, createDatabase } from './sqlite-adapter';
+import {
+  SqliteDatabase,
+  SqliteBackend,
+  createDatabase,
+  toNodeSqliteFileName,
+} from './sqlite-adapter';
 import * as fs from 'fs';
 import * as path from 'path';
 import { SchemaVersion } from '../types';
@@ -542,7 +547,13 @@ export class DatabaseConnection {
           resolve(row ? { busy: Number(row.busy), log: Number(row.log), checkpointed: Number(row.checkpointed) } : null);
         };
         try {
-          const worker = new Worker(workerSource, { eval: true, workerData: { dbPath: this.dbPath, mode } });
+          const worker = new Worker(workerSource, {
+            eval: true,
+            workerData: {
+              dbPath: toNodeSqliteFileName(this.dbPath),
+              mode,
+            },
+          });
           worker.once('message', (m: { row?: Record<string, number> | null; err?: string | null }) => {
             if (m?.err && process.env.CODEGRAPH_WAL_VALVE_DEBUG) {
               console.error(`[wal-valve] checkpoint worker (${mode}): ${m.err}`);
@@ -639,7 +650,13 @@ export class DatabaseConnection {
           if (!settled) { settled = true; resolve(); }
         };
         try {
-          const worker = new Worker(workerSource, { eval: true, workerData: { dbPath: this.dbPath, pragmas } });
+          const worker = new Worker(workerSource, {
+            eval: true,
+            workerData: {
+              dbPath: toNodeSqliteFileName(this.dbPath),
+              pragmas,
+            },
+          });
           worker.once('message', () => { void worker.terminate(); finish(); });
           worker.once('error', () => { void worker.terminate(); finish(); });
           worker.once('exit', finish);

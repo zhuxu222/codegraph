@@ -10,6 +10,8 @@
  * wasm fallback. When run from source instead, it requires Node >= 22.5.
  */
 
+import * as path from 'path';
+
 export interface SqliteStatement {
   run(...params: any[]): { changes: number; lastInsertRowid: number | bigint };
   get(...params: any[]): any;
@@ -39,6 +41,26 @@ export interface SqliteDatabase {
 export type SqliteBackend = 'node-sqlite';
 
 /**
+ * Node's filesystem APIs add the Windows extended-length prefix internally,
+ * but node:sqlite passes its filename directly to SQLite. Normalize only at
+ * that native boundary so public paths, ownership markers, and diagnostics
+ * keep their ordinary absolute-path form.
+ */
+export function toNodeSqliteFileName(
+  dbPath: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  if (
+    platform !== 'win32'
+    || dbPath === ':memory:'
+    || dbPath.startsWith('file:')
+  ) {
+    return dbPath;
+  }
+  return path.win32.toNamespacedPath(dbPath);
+}
+
+/**
  * Wraps Node's built-in `node:sqlite` (`DatabaseSync`) to match the
  * better-sqlite3 interface the rest of the code expects.
  *
@@ -54,7 +76,10 @@ class NodeSqliteAdapter implements SqliteDatabase {
   constructor(dbPath: string, opts?: { readOnly?: boolean }) {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { DatabaseSync } = require('node:sqlite');
-    this._db = opts?.readOnly ? new DatabaseSync(dbPath, { readOnly: true }) : new DatabaseSync(dbPath);
+    const fileName = toNodeSqliteFileName(dbPath);
+    this._db = opts?.readOnly
+      ? new DatabaseSync(fileName, { readOnly: true })
+      : new DatabaseSync(fileName);
   }
 
   get open(): boolean {

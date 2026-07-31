@@ -10,6 +10,12 @@ import {
   type ProjectInput,
   type ProjectLocation,
 } from '../../../src';
+import {
+  toNodeSqliteFileName,
+} from '../../../src/db/sqlite-adapter';
+import {
+  DatabaseConnection,
+} from '../../../src/db';
 
 describe('external CodeGraph data directories', () => {
   const originalCodeGraphDir = process.env.CODEGRAPH_DIR;
@@ -67,6 +73,57 @@ describe('external CodeGraph data directories', () => {
     created.close();
     const reopened = track(CodeGraph.openSync(input));
     expect(reopened.getProjectRoot()).toBe(path.resolve(projectRoot));
+    expect(reopened.getDataDir()).toBe(path.resolve(dataDir));
+  });
+
+  it('keeps long external paths ordinary across indexing and SQLite workers', async () => {
+    dataDir = path.join(
+      sandbox,
+      `indexes-${'a'.repeat(110)}`,
+      `generation-${'b'.repeat(90)}`,
+      '.codegraph',
+    );
+    const input = location();
+    const databasePath = getDatabasePath(input);
+    expect(databasePath.length).toBeGreaterThan(260);
+    fs.writeFileSync(
+      path.join(projectRoot, 'service.ts'),
+      [
+        'export function target(): number { return 1; }',
+        'export function caller(): number { return target(); }',
+        '',
+      ].join('\n'),
+    );
+
+    const nativeDatabasePath = toNodeSqliteFileName(
+      databasePath,
+      'win32',
+    );
+    expect(nativeDatabasePath).toBe(path.win32.toNamespacedPath(databasePath));
+    expect(toNodeSqliteFileName(databasePath, 'linux')).toBe(databasePath);
+    expect(
+      toNodeSqliteFileName('file:codegraph.db?mode=ro', 'win32'),
+    ).toBe('file:codegraph.db?mode=ro');
+
+    const created = track(await CodeGraph.init(input, { index: true }));
+    expect(created.getDataDir()).toBe(path.resolve(dataDir));
+    expect(fs.existsSync(databasePath)).toBe(true);
+    expect(created.searchNodes('caller').length).toBeGreaterThan(0);
+    const marker = JSON.parse(fs.readFileSync(
+      path.join(dataDir, CODEGRAPH_LOCATION_MARKER),
+      'utf8',
+    )) as { dataDir: string };
+    expect(marker.dataDir).toBe(path.resolve(dataDir));
+    expect(marker.dataDir.startsWith('\\\\?\\')).toBe(false);
+
+    created.close();
+    const database = DatabaseConnection.open(databasePath);
+    try {
+      expect(await database.checkpointWalPassive()).not.toBeNull();
+    } finally {
+      database.close();
+    }
+    const reopened = track(CodeGraph.openSync(input));
     expect(reopened.getDataDir()).toBe(path.resolve(dataDir));
   });
 
